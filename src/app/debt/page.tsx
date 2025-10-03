@@ -5,7 +5,7 @@ import { getUsdPerEur } from '@/lib/ecb';
 import { getConfig } from '@/lib/config';
 
 export default async function DebtRatioPage() {
-  const config = getConfig();
+  const config = await getConfig();
   let ratio = 0;
   let status = 'healthy';
   let reservesOclt = 0;

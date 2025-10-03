@@ -1,7 +1,7 @@
 // src/lib/config.ts
 interface Config {
   k: number;
-  ocltPerEur: number;
+  ocltPerEur: number;  // Fixed typo from earlier: 'oc ltPerEur' -> 'ocltPerEur'
   softLimit: number;
   mediumLimit: number;
   hardLimit: number;
@@ -10,11 +10,11 @@ interface Config {
 
 let configCache: Config | null = null;
 
-export function getConfig(): Config {
+export async function getConfig(): Promise<Config> {  // Make async
   if (configCache) return configCache;
 
-  // In dev/build, read from file (Vercel includes it)
-  const configData = require('../../config.json');
-  configCache = configData;
-  return configData;
+  // Dynamic import for JSON (works in both server/client)
+  const configData = await import('../../config.json');
+  configCache = configData.default || configData;  // Handle JSON export
+  return configCache;
 }

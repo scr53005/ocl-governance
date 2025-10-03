@@ -1,13 +1,7 @@
-// src/app/voting/page.tsx
 'use client';
-import { useState, useTransition } from 'react';
+import { useState, useTransition, useEffect } from 'react';
 import { getConfig } from '@/lib/config';
 import { getBalance } from '@/lib/hive-engine';
-
-interface MemberStake {
-  username: string;
-  stake: number;
-}
 
 interface VoteResult {
   totalStaked: number;
@@ -16,18 +10,32 @@ interface VoteResult {
   approvalPercent: number;
 }
 
-export default async function VotingPage() {
-  const config = getConfig();
+interface Config {
+  k: number;
+  ocltPerEur: number;
+  softLimit: number;
+  mediumLimit: number;
+  hardLimit: number;
+  members: string[];
+}
+
+export default function VotingPage() {
+  const [config, setConfig] = useState<Config | null>(null);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [result, setResult] = useState<VoteResult | null>(null);
   const [isPending, startTransition] = useTransition();
 
-  const handleSubmit = async (formData: FormData) => {
+  useEffect(() => {
+    getConfig().then(setConfig);
+  }, []);
+
+  if (!config) return <div className="container mx-auto p-8">Loading config...</div>;
+
+  const handleSubmit = () => {
     startTransition(async () => {
       const selectedUsernames = Array.from(selected);
       if (selectedUsernames.length === 0) return;
 
-      // Server-like action: fetch stakes
       const stakePromises = config.members.map(username => 
         getBalance(username).then(b => ({ username, stake: parseFloat(b.stake) }))
       );
@@ -60,7 +68,7 @@ export default async function VotingPage() {
   return (
     <div className="container mx-auto p-8">
       <h1 className="text-3xl font-bold mb-8">Governance Voting</h1>
-      <form action={handleSubmit} className="mb-8">
+      <div className="mb-8">
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4 max-h-96 overflow-y-auto">
           {config.members.map(username => (
             <label key={username} className="flex items-center">
@@ -80,13 +88,14 @@ export default async function VotingPage() {
           ))}
         </div>
         <button 
-          type="submit" 
+          type="button"
+          onClick={handleSubmit}
           disabled={isPending || selected.size === 0}
           className="mt-4 bg-blue-600 text-white px-4 py-2 rounded disabled:opacity-50"
         >
           {isPending ? 'Computing...' : 'Compute Vote Result'}
         </button>
-      </form>
+      </div>
 
       {result && (
         <div className="bg-white p-6 rounded-lg shadow-md">
