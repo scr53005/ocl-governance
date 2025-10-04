@@ -10,20 +10,13 @@ interface TokenInfo {
   circulatingSupply: string;
 }
 
-interface RPCCall {
-  jsonrpc: string;
-  method: string;
-  params: any;
-  id: number;
-}
-
 const RPC_URL = 'https://api.hive-engine.com/rpc/contracts';
 
 async function fetchWithRetry(
   url: string,
   options: RequestInit,
   maxRetries: number = 3,
-  baseDelay: number = 100
+  baseDelay: number = 200
 ): Promise<Response> {
   let lastError: Error | null = null;
 
@@ -56,7 +49,22 @@ async function fetchWithRetry(
   throw lastError || new Error('Unknown error during fetch');
 }
 
-async function fetchWithLogging(url: string, body: any): Promise<Response> {
+interface RPCPayload {
+  jsonrpc: string;
+  method: string;
+  params: {
+    contract: string;
+    table: string;
+    query: {
+      symbol?: string;
+      account?: string | { $in: string[] };
+    };
+    limit: number;
+  };
+  id: number;
+}
+
+async function fetchWithLogging(url: string, body: RPCPayload): Promise<Response> {
   const options: RequestInit = {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -79,7 +87,7 @@ async function fetchWithLogging(url: string, body: any): Promise<Response> {
 }
 
 export async function getBalance(account: string, symbol = 'OCLT'): Promise<Balance> {
-  const payload = {
+  const payload: RPCPayload = {
     jsonrpc: '2.0',
     method: 'find',
     params: {
@@ -99,12 +107,12 @@ export async function getBalance(account: string, symbol = 'OCLT'): Promise<Bala
   return {
     balance: data.balance || '0',
     stake: data.stake || '0',
-    pendingUnstake: data.pendingUnstake || '0',
+    pendingUnstake: data.pendingUnstake,
   };
 }
 
 export async function getTokenInfo(symbol = 'OCLT'): Promise<TokenInfo> {
-  const payload = {
+  const payload: RPCPayload = {
     jsonrpc: '2.0',
     method: 'find',
     params: {
@@ -128,24 +136,40 @@ export async function getTokenInfo(symbol = 'OCLT'): Promise<TokenInfo> {
   };
 }
 
-export async function batchFetchBalances(
-  calls: RPCCall[],
-  batchSize: number = 31,
-  delayBetweenBatches: number = 500
-): Promise<Balance[]> {
+interface RPCCall {
+  jsonrpc: string;
+  method: string;
+  params: {
+    contract: string;
+    table: string;
+    query: { account: string; symbol: string };
+    limit: number;
+  };
+  id: number;
+}
+
+interface BalanceResponse {
+  account: string;
+  symbol: string;
+  balance: string;
+  stake: string;
+  pendingUnstake?: string;
+}
+
+export async function batchFetchBalances(calls: RPCCall[]): Promise<Balance[]> {
   // Extract accounts from calls (assuming all calls are for OCLT balances)
   const accounts = calls.map(call => call.params.query.account);
   const uniqueAccounts = [...new Set(accounts)]; // Dedupe in case of duplicates
 
   // Single RPC call to fetch all balances
-  const payload = {
+  const payload: RPCPayload = {
     jsonrpc: '2.0',
     method: 'find',
     params: {
       contract: 'tokens',
       table: 'balances',
       query: { symbol: 'OCLT', account: { $in: uniqueAccounts } },
-      limit: 1000, // High limit to ensure all results (adjust if needed)
+      limit: 1000, // High limit to ensure all results
     },
     id: 1,
   };
@@ -157,7 +181,7 @@ export async function batchFetchBalances(
 
   const { result } = await response.json();
   const balances: Balance[] = accounts.map(account => {
-    const data = result?.find((r: any) => r.account === account) || { balance: '0', stake: '0' };
+    const data = (result as BalanceResponse[])?.find(r => r.account === account) || { balance: '0', stake: '0', pendingUnstake: '0' };
     return {
       balance: data.balance || '0',
       stake: data.stake || '0',
@@ -167,7 +191,7 @@ export async function batchFetchBalances(
 
   // Calculate total stake and log details
   const totalStake = balances.reduce((sum, b) => sum + parseFloat(b.stake), 0);
-  const stakeTable = balances.map((b, idx) => {
+  const tableData = balances.map((b, idx) => {
     const stake = parseFloat(b.stake);
     const percentage = totalStake > 0 ? ((stake / totalStake) * 100).toFixed(2) : '0.00';
     return {
@@ -178,8 +202,8 @@ export async function batchFetchBalances(
     };
   });
 
-  //console.log('Stake Distribution:');
-  //console.table(stakeTable);
+  console.log('Stake Distribution:');
+  console.table(tableData);
 
   return balances;
 }

@@ -1,7 +1,6 @@
 'use client';
 import { useState, useTransition, useEffect } from 'react';
 import { getConfig } from '@/lib/config';
-import { getBalance } from '@/lib/hive-engine';
 
 interface VoteResult {
   totalStaked: number;
