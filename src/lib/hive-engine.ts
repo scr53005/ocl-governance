@@ -10,6 +10,13 @@ interface TokenInfo {
   circulatingSupply: string;
 }
 
+interface RPCCall {
+  jsonrpc: string;
+  method: string;
+  params: any;
+  id: number;
+}
+
 const RPC_URL = 'https://api.hive-engine.com/rpc/contracts';
 
 async function fetchWithRetry(
@@ -121,47 +128,58 @@ export async function getTokenInfo(symbol = 'OCLT'): Promise<TokenInfo> {
   };
 }
 
-interface RPCCall {
-  jsonrpc: string;
-  method: string;
-  params: any;
-  id: number;
-}
-
 export async function batchFetchBalances(
   calls: RPCCall[],
-  batchSize: number = 5,
+  batchSize: number = 31,
   delayBetweenBatches: number = 500
 ): Promise<Balance[]> {
-  const results: Balance[] = [];
+  // Extract accounts from calls (assuming all calls are for OCLT balances)
+  const accounts = calls.map(call => call.params.query.account);
+  const uniqueAccounts = [...new Set(accounts)]; // Dedupe in case of duplicates
 
-  for (let i = 0; i < calls.length; i += batchSize) {
-    const batch = calls.slice(i, i + batchSize);
-    console.log(`Processing batch ${Math.floor(i / batchSize) + 1} of ${Math.ceil(calls.length / batchSize)}`);
+  // Single RPC call to fetch all balances
+  const payload = {
+    jsonrpc: '2.0',
+    method: 'find',
+    params: {
+      contract: 'tokens',
+      table: 'balances',
+      query: { symbol: 'OCLT', account: { $in: uniqueAccounts } },
+      limit: 1000, // High limit to ensure all results (adjust if needed)
+    },
+    id: 1,
+  };
 
-    const batchPromises = batch.map(async (call): Promise<Balance> => {
-      const response = await fetchWithLogging(RPC_URL, call);
-      if (!response.ok) throw new Error('Failed to fetch balance in batch');
-      const { result } = await response.json();
-      const data = result?.[0] || { balance: '0', stake: '0' };
-      return {
-        balance: data.balance || '0',
-        stake: data.stake || '0',
-        ...(data.pendingUnstake !== undefined && { pendingUnstake: data.pendingUnstake }),
-      };
-    });
+  console.log(`Fetching balances for ${uniqueAccounts.length} accounts in a single call`);
 
-    const batchResults = await Promise.allSettled(batchPromises);
-    results.push(
-      ...batchResults
-        .filter((r): r is PromiseFulfilledResult<Balance> => r.status === 'fulfilled')
-        .map(r => r.value)
-    );
+  const response = await fetchWithLogging(RPC_URL, payload);
+  if (!response.ok) throw new Error('Failed to fetch balances in batch');
 
-    if (i + batchSize < calls.length) {
-      await new Promise(resolve => setTimeout(resolve, delayBetweenBatches));
-    }
-  }
+  const { result } = await response.json();
+  const balances: Balance[] = accounts.map(account => {
+    const data = result?.find((r: any) => r.account === account) || { balance: '0', stake: '0' };
+    return {
+      balance: data.balance || '0',
+      stake: data.stake || '0',
+      ...(data.pendingUnstake !== undefined && { pendingUnstake: data.pendingUnstake }),
+    };
+  });
 
-  return results;
+  // Calculate total stake and log details
+  const totalStake = balances.reduce((sum, b) => sum + parseFloat(b.stake), 0);
+  const stakeTable = balances.map((b, idx) => {
+    const stake = parseFloat(b.stake);
+    const percentage = totalStake > 0 ? ((stake / totalStake) * 100).toFixed(2) : '0.00';
+    return {
+      Account: accounts[idx],
+      'Staked OCLT': stake.toFixed(3),
+      'Total Staked OCLT': totalStake.toFixed(3),
+      'Percentage (%)': percentage,
+    };
+  });
+
+  //console.log('Stake Distribution:');
+  //console.table(stakeTable);
+
+  return balances;
 }
