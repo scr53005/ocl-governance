@@ -31,29 +31,29 @@ export default async function DebtRatioPage() {
     debt = circulatingSupply - ito1Total;
     console.log('Debt-backed (OCLT):', debt);
 
-    if (reservesOclt > 0) {
-      ratio = (debt / reservesOclt) * 100;
+    if (debt > 0) {
+      ratio = (reservesOclt / debt) * 100;
       console.log('Debt Ratio (%):', ratio);
     } else {
       console.warn('Reserves are zero, cannot compute ratio');
     }
 
     // Compare limits
-    if (ratio > config.hardLimit) status = 'critical';
-    else if (ratio > config.mediumLimit) status = 'warning';
-    else if (ratio > config.softLimit) status = 'caution';
+    if (ratio < config.hardLimit) status = 'critical';
+    else if (ratio < config.mediumLimit) status = 'warning';
+    else if (ratio < config.softLimit) status = 'caution';
   } catch (error) {
-    console.error('Debt ratio error:', error);
+    console.error('Deposit ratio error:', error);
   }
 
   return (
     <div className="container mx-auto p-8">
       <h1 className="text-3xl font-bold mb-8">Debt to Reserves Ratio</h1>
       <div className="bg-white p-6 rounded-lg shadow-md">
-        <p><strong>Debt (OCLT):</strong> {debt.toFixed(3)}</p>
-        <p><strong>Reserves (OCLT equiv.):</strong> {reservesOclt.toFixed(3)}</p>
-        <p><strong>Ratio (%):</strong> <span className={`font-bold ${status === 'critical' ? 'text-red-600' : status === 'warning' ? 'text-yellow-600' : status === 'caution' ? 'text-orange-600' : 'text-green-600'}`}>{ratio.toFixed(2)}%</span></p>
-        <p><strong>Status:</strong> {status.toUpperCase()}</p>
+        <p><strong>Deposits (OCLT equiv.):</strong> {reservesOclt.toFixed(3)}</p>
+        <p><strong>Total liabilities (OCLT):</strong> {debt.toFixed(3)}</p>
+        <p><strong>Deposit Ratio (%):</strong> <span className={`font-bold ${status === 'critical' ? 'text-red-600' : status === 'warning' ? 'text-yellow-600' : status === 'caution' ? 'text-orange-600' : 'text-green-600'}`}>{ratio.toFixed(2)}%</span></p>
+        <p><strong>Status:</strong><span className={`font-bold ${status === 'critical' ? 'text-red-600' : status === 'warning' ? 'text-yellow-600' : status === 'caution' ? 'text-orange-600' : 'text-green-600'}`}> {status.toUpperCase()}</span></p>
         <div className="mt-4">
           <p>Limits: Soft {config.softLimit}%, Medium {config.mediumLimit}%, Hard {config.hardLimit}%</p>
         </div>

@@ -1,9 +1,9 @@
 {
   "k": 1,
   "ocltPerEur": 500,
-  "softLimit": 40,
-  "mediumLimit": 45,
-  "hardLimit": 60,
+  "softLimit": 16,
+  "mediumLimit": 10,
+  "hardLimit": 4,
   "members": [
     "sorin.offchain",
     "sub7security",
