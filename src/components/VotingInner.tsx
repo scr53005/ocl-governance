@@ -83,7 +83,7 @@ export default function VotingInner() {
 
       <div className="bg-blue-50 p-4 rounded-lg mb-6 border border-blue-200">
         <p className="text-gray-700">
-          <strong>Voting Power Formula:</strong> Unweighted member voting power = 1 + k * (member's percentage of total OCLT staked)
+          <strong>Voting Power Formula:</strong> Unweighted member voting power = 1 + k * (member&apos;s percentage of total OCLT staked)
         </p>
         <p className="text-gray-700 mt-1">
           where <strong>k = {k.toFixed(1)}</strong> (1.5 × {config.members.length} members)
