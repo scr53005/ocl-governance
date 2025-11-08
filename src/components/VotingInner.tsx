@@ -10,7 +10,6 @@ interface VoteResult {
 }
 
 interface Config {
-  k: number;
   ocltPerEur: number;
   softLimit: number;
   mediumLimit: number;
@@ -51,14 +50,17 @@ export default function VotingInner() {
       const totalStaked = membersWithStakes.reduce((sum: number, m: MemberStake) => sum + m.stake, 0);
       if (totalStaked === 0) return;
 
-      const totalPossibleWeighted = membersWithStakes.reduce((sum: number, m: MemberStake) => 
-        sum + (1 + config.k * (m.stake / totalStaked)), 0
+      // Calculate k dynamically: k = 1.5 * number of members
+      const k = 1.5 * config.members.length;
+
+      const totalPossibleWeighted = membersWithStakes.reduce((sum: number, m: MemberStake) =>
+        sum + (1 + k * (m.stake / totalStaked)), 0
       );
 
       const weightedInFavor = selectedUsernames.reduce((sum: number, username: string) => {
         const member = membersWithStakes.find(m => m.username === username);
         if (!member) return sum;
-        return sum + (1 + config.k * (member.stake / totalStaked));
+        return sum + (1 + k * (member.stake / totalStaked));
       }, 0);
 
       const approvalPercent = (weightedInFavor / totalPossibleWeighted) * 100;
@@ -72,9 +74,22 @@ export default function VotingInner() {
     });
   };
 
+  // Calculate k for display
+  const k = 1.5 * config.members.length;
+
   return (
     <div className="container mx-auto p-8">
       <h1 className="text-3xl font-bold mb-8">Governance Voting</h1>
+
+      <div className="bg-blue-50 p-4 rounded-lg mb-6 border border-blue-200">
+        <p className="text-gray-700">
+          <strong>Voting Power Formula:</strong> Unweighted member voting power = 1 + k * (member's percentage of total OCLT staked)
+        </p>
+        <p className="text-gray-700 mt-1">
+          where <strong>k = {k.toFixed(1)}</strong> (1.5 × {config.members.length} members)
+        </p>
+      </div>
+
       <div className="mb-8">
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4 max-h-96 overflow-y-auto">
           {config.members.map(username => (
@@ -106,7 +121,7 @@ export default function VotingInner() {
 
       {result && (
         <div className="bg-white p-6 rounded-lg shadow-md">
-          <h2 className="text-2xl font-semibold mb-4">Vote Result (k={config.k})</h2>
+          <h2 className="text-2xl font-semibold mb-4">Vote Result (k={k.toFixed(1)})</h2>
           <p><strong>Total Staked OCLT (members):</strong> {result.totalStaked.toFixed(3)}</p>
           <p><strong>Total Possible Weighted Votes:</strong> {result.totalPossibleWeighted.toFixed(2)}</p>
           <p><strong>Weighted Votes in Favor:</strong> {result.weightedInFavor.toFixed(2)}</p>

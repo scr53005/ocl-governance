@@ -25,6 +25,7 @@ export async function GET() {
       username: config.members[index],
       stake: parseFloat(balance.stake),
     }));
+    console.log('Fetched stakes for members:', membersWithStakes);
 
     return NextResponse.json({ membersWithStakes });
   } catch (error) {

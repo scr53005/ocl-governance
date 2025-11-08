@@ -1,6 +1,5 @@
 // src/lib/config.ts
 interface Config {
-  k: number;
   ocltPerEur: number;  // Fixed typo from earlier: 'oc ltPerEur' -> 'ocltPerEur'
   softLimit: number;
   mediumLimit: number;
