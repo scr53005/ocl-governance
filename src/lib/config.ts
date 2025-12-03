@@ -4,6 +4,8 @@ interface Config {
   softLimit: number;
   mediumLimit: number;
   hardLimit: number;
+  treasuryAccount: string;
+  itoAccount: string;
   members: string[];
 }
 

@@ -6,7 +6,7 @@ const inter = Inter({ subsets: ['latin'] })
 
 export const metadata: Metadata = {
   title: 'OCL Governance App',
-  description: 'Voting and deposit ratio tools for OffChain Luxembourg',
+  description: 'Voting and reserve ratio tools for OffChain Luxembourg',
 }
 
 export default function RootLayout({

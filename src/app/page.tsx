@@ -39,7 +39,7 @@ export default function HomePage() {
             href="/debt"
             className="bg-green-600 hover:bg-green-700 text-white font-semibold py-3 px-6 rounded-lg shadow-md transition-colors duration-200 text-lg w-full sm:w-auto text-center"
           >
-            Deposit Ratio
+            Reserve Ratio
           </Link>
         </div>
       </div>

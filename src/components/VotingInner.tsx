@@ -26,6 +26,7 @@ export default function VotingInner() {
   const [config, setConfig] = useState<Config | null>(null);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [result, setResult] = useState<VoteResult | null>(null);
+  const [error, setError] = useState<string | null>(null);
   const [isPending, startTransition] = useTransition();
 
   useEffect(() => {
@@ -39,38 +40,50 @@ export default function VotingInner() {
       const selectedUsernames = Array.from(selected);
       if (selectedUsernames.length === 0) return;
 
-      // Fetch stakes via API (client-safe)
-      const response = await fetch('/api/stakes');
-      if (!response.ok) {
-        console.error('API error:', response.statusText);
-        return;
+      // Clear previous error
+      setError(null);
+
+      try {
+        // Fetch stakes via API (client-safe)
+        const response = await fetch('/api/stakes');
+        if (!response.ok) {
+          const errorText = await response.text();
+          throw new Error(`Failed to fetch stake data: ${response.status} ${response.statusText}. ${errorText}`);
+        }
+        const { membersWithStakes }: { membersWithStakes: MemberStake[] } = await response.json();
+
+        const totalStaked = membersWithStakes.reduce((sum: number, m: MemberStake) => sum + m.stake, 0);
+        if (totalStaked === 0) {
+          throw new Error('Total staked OCLT is zero. Cannot calculate vote weights.');
+        }
+
+        // Calculate k dynamically: k = 1.5 * number of members
+        const k = 1.5 * config.members.length;
+        console.log('Using k =', k);
+
+        const totalPossibleWeighted = membersWithStakes.reduce((sum: number, m: MemberStake) =>
+          sum + (1 + k * (m.stake / totalStaked)), 0
+        );
+
+        const weightedInFavor = selectedUsernames.reduce((sum: number, username: string) => {
+          const member = membersWithStakes.find(m => m.username === username);
+          if (!member) return sum;
+          return sum + (1 + k * (member.stake / totalStaked));
+        }, 0);
+
+        const approvalPercent = (weightedInFavor / totalPossibleWeighted) * 100;
+
+        setResult({
+          totalStaked,
+          totalPossibleWeighted,
+          weightedInFavor,
+          approvalPercent,
+        });
+      } catch (err) {
+        console.error('Vote calculation error:', err);
+        setError(err instanceof Error ? err.message : 'An unexpected error occurred while calculating votes.');
+        setResult(null);
       }
-      const { membersWithStakes }: { membersWithStakes: MemberStake[] } = await response.json();
-
-      const totalStaked = membersWithStakes.reduce((sum: number, m: MemberStake) => sum + m.stake, 0);
-      if (totalStaked === 0) return;
-
-      // Calculate k dynamically: k = 1.5 * number of members
-      const k = 1.5 * config.members.length;
-
-      const totalPossibleWeighted = membersWithStakes.reduce((sum: number, m: MemberStake) =>
-        sum + (1 + k * (m.stake / totalStaked)), 0
-      );
-
-      const weightedInFavor = selectedUsernames.reduce((sum: number, username: string) => {
-        const member = membersWithStakes.find(m => m.username === username);
-        if (!member) return sum;
-        return sum + (1 + k * (member.stake / totalStaked));
-      }, 0);
-
-      const approvalPercent = (weightedInFavor / totalPossibleWeighted) * 100;
-
-      setResult({
-        totalStaked,
-        totalPossibleWeighted,
-        weightedInFavor,
-        approvalPercent,
-      });
     });
   };
 
@@ -109,7 +122,7 @@ export default function VotingInner() {
             </label>
           ))}
         </div>
-        <button 
+        <button
           type="button"
           onClick={handleSubmit}
           disabled={isPending || selected.size === 0}
@@ -118,6 +131,13 @@ export default function VotingInner() {
           {isPending ? 'Computing...' : 'Compute Vote Result'}
         </button>
       </div>
+
+      {error && (
+        <div className="bg-red-50 border border-red-200 text-red-800 p-4 rounded-lg mb-6">
+          <h3 className="font-semibold mb-1">Error</h3>
+          <p className="text-sm">{error}</p>
+        </div>
+      )}
 
       {result && (
         <div className="bg-white p-6 rounded-lg shadow-md">
