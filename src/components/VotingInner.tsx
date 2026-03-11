@@ -1,6 +1,5 @@
 'use client';
 import { useState, useTransition, useEffect } from 'react';
-import { getConfig } from '@/lib/config';
 
 interface VoteResult {
   totalStaked: number;
@@ -30,7 +29,10 @@ export default function VotingInner() {
   const [isPending, startTransition] = useTransition();
 
   useEffect(() => {
-    getConfig().then(setConfig);
+    fetch('/api/config')
+      .then((res) => res.json())
+      .then(setConfig)
+      .catch((err) => console.error('Failed to load config:', err));
   }, []);
 
   if (!config) return <div className="container mx-auto p-8">Loading config...</div>;

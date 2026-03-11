@@ -3,6 +3,15 @@ import { getHbdBalance } from '@/lib/hive';
 import { getBalance, getTokenInfo } from '@/lib/hive-engine';
 import { getUsdPerEur } from '@/lib/ecb';
 import { getConfig } from '@/lib/config';
+import { redis } from '@/lib/redis';
+import ProjectionTable from '@/components/ProjectionTable';
+
+interface ProjectionRow {
+  id: string;
+  date: string;
+  hbdAmount: number;
+  reason: string;
+}
 
 // Revalidate every 5 minutes (300 seconds) to match stakes API
 export const revalidate = 300;
@@ -13,36 +22,32 @@ export default async function DebtRatioPage() {
   let status = 'healthy';
   let reservesOclt = 0;
   let publicCirculation = 0;
+  let hbd = 0;
+  let eurPerUsd = 0;
   let errorMessage: string | null = null;
 
   try {
     // Fetch data
-    const [hbd, usdPerEur, tokenInfo, ito1Balance] = await Promise.all([
+    const [hbdVal, usdPerEur, tokenInfo, ito1Balance] = await Promise.all([
       getHbdBalance(config.treasuryAccount),
       getUsdPerEur(),
       getTokenInfo(),
       getBalance(config.itoAccount),
     ]);
 
-    console.log('Fetched data:', { hbd, usdPerEur, tokenInfo, ito1Balance });
-    const eurPerUsd = 1 / usdPerEur;
+    hbd = hbdVal;
+    eurPerUsd = 1 / usdPerEur;
     const reservesEur = hbd * eurPerUsd;
     reservesOclt = reservesEur * config.ocltPerEur;
-    console.log('Euro-backed OCLT:', reservesOclt);
+
     const circulatingSupply = parseFloat(tokenInfo.circulatingSupply);
-    console.log('Circulating Supply:', circulatingSupply);
     const ito1Total = parseFloat(ito1Balance.balance) + parseFloat(ito1Balance.stake);
     publicCirculation = circulatingSupply - ito1Total;
-    console.log('Public Circulation (OCLT):', publicCirculation);
 
     if (publicCirculation > 0) {
       ratio = (reservesOclt / publicCirculation) * 100;
-      console.log('Reserve Ratio (%):', ratio);
-    } else {
-      console.warn('Public circulation is zero or negative, cannot compute ratio');
     }
 
-    // Compare limits
     if (ratio < config.hardLimit) status = 'critical';
     else if (ratio < config.mediumLimit) status = 'warning';
     else if (ratio < config.softLimit) status = 'caution';
@@ -51,6 +56,16 @@ export default async function DebtRatioPage() {
     errorMessage = error instanceof Error ? error.message : 'An unexpected error occurred while fetching reserve data.';
     status = 'error';
   }
+
+  // Fetch saved projections
+  let projectionRows: ProjectionRow[] = [];
+  try {
+    projectionRows = (await redis.get<ProjectionRow[]>('projections')) ?? [];
+  } catch (error) {
+    console.error('Failed to fetch projections:', error);
+  }
+
+  const targetRatio = config.softLimit + 0.01;
 
   return (
     <div className="container mx-auto p-8">
@@ -73,6 +88,16 @@ export default async function DebtRatioPage() {
           <p>Limits: Soft {config.softLimit}%, Medium {config.mediumLimit}%, Hard {config.hardLimit}%</p>
         </div>
       </div>
+
+      <ProjectionTable
+        currentHbd={hbd}
+        eurPerUsd={eurPerUsd}
+        ocltPerEur={config.ocltPerEur}
+        publicCirculation={publicCirculation}
+        targetRatio={targetRatio}
+        initialRows={projectionRows}
+      />
+
       <p className="mt-4 text-sm text-gray-600">Last updated: {new Date().toLocaleString()}</p>
       <p className="mt-2 text-sm text-gray-500">Refresh page for latest data (ECB/Hive updates daily/block-by-block).</p>
     </div>

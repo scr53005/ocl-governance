@@ -1,6 +1,8 @@
 // src/lib/config.ts
+import { redis } from './redis';
+
 interface Config {
-  ocltPerEur: number;  // Fixed typo from earlier: 'oc ltPerEur' -> 'ocltPerEur'
+  ocltPerEur: number;
   softLimit: number;
   mediumLimit: number;
   hardLimit: number;
@@ -9,13 +11,8 @@ interface Config {
   members: string[];
 }
 
-let configCache: Config | null = null;
-
-export async function getConfig(): Promise<Config> {  // Make async
-  if (configCache) return configCache;
-
-  // Dynamic import for JSON (works in both server/client)
-  const configData = await import('../../config.json');
-  configCache = configData.default || configData;  // Handle JSON export
-  return configCache;
+export async function getConfig(): Promise<Config> {
+  const config = await redis.get<Config>('config');
+  if (!config) throw new Error('Config not found in KV store. Run the seed script first.');
+  return config;
 }
