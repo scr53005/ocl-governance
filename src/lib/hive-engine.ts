@@ -1,4 +1,125 @@
 // src/lib/hive-engine.ts
+
+// ── AMM pool & swap helpers (ported from Liman) ────────────────────
+
+const HE_API = 'https://api.hive-engine.com/rpc/contracts';
+
+type PoolReserves = {
+  baseQuantity: number;
+  quoteQuantity: number;
+};
+
+/** Query AMM pool reserves for a token pair (e.g., "SWAP.HIVE:OCLT"). */
+export async function getPoolReserves(tokenPair: string): Promise<PoolReserves> {
+  const res = await fetch(HE_API, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'findOne',
+      params: {
+        contract: 'marketpools',
+        table: 'pools',
+        query: { tokenPair },
+      },
+    }),
+  });
+
+  if (!res.ok) throw new Error(`Hive Engine API error: ${res.status}`);
+
+  const data = await res.json();
+  const pool = data.result;
+  if (!pool) throw new Error(`Pool not found: ${tokenPair}`);
+
+  return {
+    baseQuantity: parseFloat(pool.baseQuantity),
+    quoteQuantity: parseFloat(pool.quoteQuantity),
+  };
+}
+
+/**
+ * Calculate expected output from a constant product AMM swap.
+ * Formula: expectedOut = (amountIn * quoteReserve) / (baseReserve + amountIn)
+ */
+export function calculateSwapOutput(
+  amountIn: number,
+  baseReserve: number,
+  quoteReserve: number,
+  slippage: number = 0.02,
+): { expectedOut: number; minAmountOut: number } {
+  const expectedOut = (amountIn * quoteReserve) / (baseReserve + amountIn);
+  return {
+    expectedOut,
+    minAmountOut: expectedOut * (1 - slippage),
+  };
+}
+
+/**
+ * Calculate the max input amount that keeps price impact within a target %.
+ * For constant product AMM: priceImpact = amountIn / (baseReserve + amountIn)
+ * Solving for amountIn: maxIn = baseReserve * maxImpact / (1 - maxImpact)
+ */
+export function calculateMaxInputForImpact(
+  baseReserve: number,
+  maxImpact: number,
+): number {
+  return (baseReserve * maxImpact) / (1 - maxImpact);
+}
+
+/** Build the custom_json payload for a Hive Engine marketpools swap. */
+export function buildSwapPayload(params: {
+  tokenPair: string;
+  tokenSymbol: string;
+  tokenAmount: string;
+  tradeType: 'exactInput' | 'exactOutput';
+  minAmountOut: string;
+}): string {
+  return JSON.stringify({
+    contractName: 'marketpools',
+    contractAction: 'swapTokens',
+    contractPayload: {
+      tokenPair: params.tokenPair,
+      tokenSymbol: params.tokenSymbol,
+      tokenAmount: params.tokenAmount,
+      tradeType: params.tradeType,
+      minAmountOut: params.minAmountOut,
+    },
+  });
+}
+
+/** Memo for wrapping HIVE → SWAP.HIVE via @honey-swap. */
+export const HONEY_SWAP_MEMO = JSON.stringify({
+  id: 'ssc-mainnet-hive',
+  json: {
+    contractName: 'hivepegged',
+    contractAction: 'buy',
+    contractPayload: {},
+  },
+});
+
+// ── Token operation payloads (new) ──────────────────────────────────
+
+/** Build custom_json payload to stake tokens TO another account. */
+export function buildStakePayload(to: string, symbol: string, quantity: string): string {
+  return JSON.stringify({
+    contractName: 'tokens',
+    contractAction: 'stake',
+    contractPayload: { to, symbol, quantity },
+  });
+}
+
+/** Build custom_json payload to transfer tokens to another account. */
+export function buildTokenTransferPayload(to: string, symbol: string, quantity: string, memo: string = ''): string {
+  return JSON.stringify({
+    contractName: 'tokens',
+    contractAction: 'transfer',
+    contractPayload: { to, symbol, quantity, memo },
+  });
+}
+
+// ── Existing read-only helpers ──────────────────────────────────────
+
 interface Balance {
   balance: string; // Liquid (as string, e.g., "100.000")
   stake: string;   // Staked
@@ -10,7 +131,7 @@ interface TokenInfo {
   circulatingSupply: string;
 }
 
-const RPC_URL = 'https://api.hive-engine.com/rpc/contracts';
+const RPC_URL = HE_API;
 
 async function fetchWithRetry(
   url: string,

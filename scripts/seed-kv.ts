@@ -49,6 +49,26 @@ async function seed() {
     console.log('Projections key already exists, skipping.');
   }
 
+  // Memo routing table (idempotent — only set if not present)
+  const existingRoutes = await redis.get('memo_routes');
+  if (!existingRoutes) {
+    await redis.set('memo_routes', JSON.stringify([
+      { keyword: 'membership', event: 'membership/payment-received', active: true },
+    ]));
+    console.log('Seeded memo_routes.');
+  } else {
+    console.log('memo_routes already exists, skipping.');
+  }
+
+  // Transfer scanner cursor (idempotent)
+  const existingCursor = await redis.get('membership:last_tx_id');
+  if (existingCursor === null) {
+    await redis.set('membership:last_tx_id', -1);
+    console.log('Initialized membership:last_tx_id cursor.');
+  } else {
+    console.log('membership:last_tx_id already exists, skipping.');
+  }
+
   console.log('Done.');
 }
 

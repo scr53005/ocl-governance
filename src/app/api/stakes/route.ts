@@ -3,7 +3,7 @@ import { NextResponse } from 'next/server';
 import { getConfig } from '@/lib/config';
 import { batchFetchBalances } from '@/lib/hive-engine';
 
-export const revalidate = 300;
+export const dynamic = 'force-dynamic';
 
 export async function GET() {
   try {
