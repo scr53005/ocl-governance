@@ -68,7 +68,7 @@ async function main() {
     const accounts = await client.database.getAccounts(chunk);
 
     for (const acct of accounts) {
-      const info = acct as Record<string, unknown>;
+      const info = acct as unknown as Record<string, unknown>;
 
       // Check 1: recovery_account
       if (info.recovery_account === CREATOR) {
@@ -134,7 +134,7 @@ async function main() {
     const accounts = await client.database.getAccounts(chunk);
 
     for (const acct of accounts) {
-      const info = acct as Record<string, unknown>;
+      const info = acct as unknown as Record<string, unknown>;
       const isOurRecovery = info.recovery_account === CREATOR;
       const created = String(info.created);
       const marker = isOurRecovery ? 'OURS' : 'NOT OURS';

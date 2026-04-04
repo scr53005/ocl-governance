@@ -14,8 +14,8 @@ A governance back-office for OffChain Luxembourg, built with Next.js and deploye
 
 When HIVE arrives on `ocl-paymaster` with a membership memo (e.g., `cus_XXX:membership:1year:flavien-3`), an automated workflow:
 
-1. **Verifies/creates the member's Hive account** — checks ownership via `recovery_account`, creates via offchain.lu API if needed
-2. **Converts received HIVE** — 90% sold for HBD (staked to savings), 10% wrapped to SWAP.HIVE and swapped for OCLT via Hive Engine AMM
+1. **Verifies/creates the member's Hive account** — checks ownership via `recovery_account` + creation date (must be 2026+), creates via offchain.lu API if needed. Aborts with admin alert on name collision.
+2. **Converts received HIVE** — 90% sold for HBD (staked to savings: ocl-paymaster if < 600 HBD in savings, otherwise ocl-trez), 10% wrapped to SWAP.HIVE and swapped for OCLT via Hive Engine AMM
 3. **Provisions the member** — stakes OCLT, transfers liquid OCLT + HBD, registers in governance
 4. **Sends credentials** — emails account keys if a new account was created
 
@@ -102,6 +102,8 @@ src/
     inngest-functions.ts                 Membership provisioning workflow
 scripts/
   seed-kv.ts                             Config + memo routes seed script
+  backfill-customers.ts                  Backfill customer records into Redis
+  list-our-accounts.ts                   Audit Hive accounts owned by offchain-lux
 config.json                              Base configuration (seeded to Redis)
 vercel.json                              Cron schedule configuration
 ```
