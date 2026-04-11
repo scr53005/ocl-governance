@@ -137,9 +137,10 @@ Create a `.env.local` file:
 # Redis (required)
 GOV_KV_REST_API_URL=https://your-db.upstash.io
 GOV_KV_REST_API_TOKEN=your-token
+GOV_KV_ENV=dev                         # Optional human-readable label ("dev" / "prod") printed by the safety banner in seed/dev scripts. Purely for mis-click protection.
 
 # Membership provisioning
-HIVE_PAYMASTER_ACCOUNT=                # Optional — override the paymaster account (default: ocl-paymaster). Use in .env.local only, for dev against a test account like decent-tester.
+HIVE_PAYMASTER_ACCOUNT=                # Optional — override the paymaster account (default: ocl-paymaster). Use in .env.local only, for dev against a test account like decent-tester. See the "Dev environment" note below before setting this in Vercel.
 HIVE_ACTIVE_KEY_PAYMASTER=...          # Active private key of the paymaster account (prod: ocl-paymaster, dev: whatever HIVE_PAYMASTER_ACCOUNT points at)
 CRON_SECRET=...                        # Vercel cron auth token
 INNGEST_EVENT_KEY=...                  # Inngest event key (preview)
@@ -149,13 +150,17 @@ OCL_INTERNAL_API_KEY=...               # Shared secret for cross-app auth
 OFFCHAIN_LU_URL=https://www.offchain.lu  # Website API base URL
 ```
 
+**Dev environment note.** For local testing, run against a **separate dev Upstash instance** (create a second DB in the Upstash console and point `GOV_KV_REST_API_URL` / `GOV_KV_REST_API_TOKEN` at it in `.env.local`) and a **separate dev Hive account** (e.g. `decent-tester`) by setting `HIVE_PAYMASTER_ACCOUNT` and `HIVE_ACTIVE_KEY_PAYMASTER` accordingly. This keeps dev transfers, TxRecords, and cursor state fully isolated from prod. In Vercel, `HIVE_PAYMASTER_ACCOUNT` should either be **unset** (code falls back to `ocl-paymaster`) or **explicitly set to `ocl-paymaster`** — never to a dev account.
+
 ### Install and Seed
 
 ```bash
 npm install
-npm run seed    # pushes config + memo routes into Redis (one-time)
-npm run dev     # starts dev server at http://localhost:3000
+npm run seed    # pushes config + memo routes into Redis (one-time). Prints a safety banner with host + GOV_KV_ENV label before writing — double-check before hitting enter.
+npx next dev --port 3100    # dev server at http://localhost:3100
 ```
+
+(Port 3100 is the project convention — port 3000 is reserved for a sibling app.)
 
 ### Local Inngest Development
 
@@ -165,7 +170,19 @@ In a separate terminal:
 npx inngest-cli@latest dev
 ```
 
-This starts the Inngest dev dashboard at `http://localhost:8288` where you can inspect and test the membership-provision workflow.
+This starts the Inngest dev dashboard at `http://localhost:8288` where you can inspect and test the workflows. Make sure `INNGEST_DEV=1` in `.env.local` so the SDK talks to the local dashboard instead of Inngest Cloud.
+
+### Dev fixtures and cursor management
+
+Three helper scripts make dev testing against a real Hive account safe and repeatable:
+
+- `npx tsx scripts/seed-dev-customer.ts` — writes fake `CustomerRecord` fixtures (e.g. `cus_TESTDRIFT001`, `cus_TESTEDU001`) into dev Redis so `lookup-customer` steps pass. Refuses to run if `GOV_KV_ENV=prod` unless `--force` is passed. Note the customer IDs have no internal underscores — the memo validator regex `/^cus_[A-Za-z0-9]+$/` only allows one `_` (the prefix delimiter).
+- `npx tsx scripts/set-cursor.ts` — advances `membership:last_tx_id` (the paymaster-wide scan cursor) past existing account history so a freshly seeded dev Redis doesn't re-process the entire backlog on the first cron run. Supports `--value N` for an exact sequence number and `--reset` to go back to `-1`.
+- Trigger the cron manually from PowerShell:
+  ```powershell
+  Invoke-RestMethod -Uri "http://localhost:3100/api/cron/scan-transfers" `
+    -Headers @{ Authorization = "Bearer $env:CRON_SECRET" }
+  ```
 
 ## Project Structure
 
@@ -194,7 +211,9 @@ src/
     workflow-helpers.ts                  Chunked HBD/OCLT swaps, savings routing, alerts, Redis helpers
     inngest-functions.ts                 Membership + education provisioning workflows
 scripts/
-  seed-kv.ts                             Config + memo routes seed script
+  seed-kv.ts                             Config + memo routes seed script (with dev/prod safety banner)
+  seed-dev-customer.ts                   Seed fake CustomerRecord fixtures into dev Redis (refuses prod without --force)
+  set-cursor.ts                          Advance/reset the paymaster-wide scan cursor (membership:last_tx_id)
   backfill-customers.ts                  Backfill customer records into Redis
   list-our-accounts.ts                   Audit Hive accounts owned by offchain-lux
 config.json                              Base configuration (seeded to Redis)
@@ -227,8 +246,9 @@ A dedicated back-office page (e.g. `/workflows` or `/sales`) that lists membersh
 
 Deployed on Vercel at [dho.offchain.lu](https://dho.offchain.lu). Required environment variables in Vercel:
 
-- `GOV_KV_REST_API_URL`, `GOV_KV_REST_API_TOKEN` — Upstash Redis
-- `HIVE_ACTIVE_KEY_PAYMASTER` — Hive active key for ocl-paymaster
+- `GOV_KV_REST_API_URL`, `GOV_KV_REST_API_TOKEN` — Upstash Redis (prod instance)
+- `HIVE_ACTIVE_KEY_PAYMASTER` — Hive active key for `ocl-paymaster`
+- `HIVE_PAYMASTER_ACCOUNT` — either unset, or explicitly `ocl-paymaster`. **Never** a dev account like `decent-tester`.
 - `CRON_SECRET` — Vercel cron authentication
 - `INNGEST_EVENT_KEY`, `INNGEST_SIGNING_KEY` — Inngest (production keys)
 - `OCL_INTERNAL_API_KEY` — Cross-app auth with offchain.lu
