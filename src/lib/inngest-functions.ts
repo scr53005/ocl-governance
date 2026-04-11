@@ -1,137 +1,38 @@
 import { inngest } from './inngest';
 import { redis } from './redis';
 import {
-  accountExists,
   getAccountInfo,
-  getOrderBook,
-  broadcastLimitOrder,
   broadcastHiveTransfer,
   broadcastCustomJson,
-  broadcastToSavings,
-  getLiquidHbdBalance,
-  getSavingsHbdBalance,
   hbd,
   hive,
-  makeRequestId,
 } from './hive';
 import {
-  getPoolReserves,
-  calculateSwapOutput,
-  buildSwapPayload,
-  calculateMaxInputForImpact,
   buildStakePayload,
   buildTokenTransferPayload,
-  HONEY_SWAP_MEMO,
   getBalance,
 } from './hive-engine';
+import type { Config, CustomerRecord, MembershipDuration } from './types';
+import {
+  PAYMASTER,
+  updateTxRecord,
+  getConfig,
+  callOffchainLu,
+  sendAlert,
+  chunkedHbdSwap,
+  wrapAndChunkedOcltSwap,
+  hbdToSavings,
+} from './workflow-helpers';
 
-// ── Types ──────────────────────────────────────────────────────────────
+// ── Membership-specific helper ─────────────────────────────────────────
 
-type TxRecord = {
-  status: string;
-  memo: string;
-  hive_amount: number;
-  account_name: string;
-  duration: string;
-  stripe_customer_id: string;
-  incoming_tx_id: string;
-  fund_creator_tx_id: string | null;
-  account_creation_tx_id: string | null;
-  hbd_order_tx_id: string | null;
-  hbd_savings_tx_id: string | null;
-  oclt_stake_tx_id: string | null;
-  oclt_transfer_tx_id: string | null;
-  hbd_transfer_tx_id: string | null;
-  swap_hive_tx_id: string | null;
-  swap_oclt_tx_id: string | null;
-  created_at: string;
-  processed_at: string | null;
-  error: string | null;
-};
-
-type CustomerRecord = {
-  customerId: string;
-  email: string;
-  firstName: string;
-  lastName: string;
-  phoneNumber: string;
-  preferredHiveHandle: string;
-  actualHiveHandle: string | null;
-  membershipType: string;
-  hiveAccountCreated: string;
-  stripeSessionId: string;
-  createdAt: string;
-  provisionedAt: string | null;
-};
-
-type Config = {
-  members: string[];
-  membershipStakeOclt1Year?: number;
-  membershipStakeOclt6Month?: number;
-  membershipLiquidOclt1Year?: number;
-  membershipLiquidOclt6Month?: number;
-  membershipHbd1Year?: number;
-  membershipHbd6Month?: number;
-  hiveToHbdPct?: number;
-  hiveToOcltPct?: number;
-  ocltSwapMaxSlippage?: number;
-  paymasterSavingsThreshold?: number;
-  accountCreationFee?: number;
-  treasuryAccount?: string;
-};
-
-// ── Helpers ────────────────────────────────────────────────────────────
-
-const PAYMASTER = 'ocl-paymaster';
-
-function txKey(txId: string): string {
-  return `membership:tx:${txId}`;
-}
-
-async function updateTxRecord(txId: string, updates: Partial<TxRecord>): Promise<void> {
-  const raw = await redis.get<TxRecord>(txKey(txId));
-  const existing: TxRecord = typeof raw === 'string' ? JSON.parse(raw) : raw!;
-  await redis.set(txKey(txId), JSON.stringify({ ...existing, ...updates }));
-}
-
-async function getConfig(): Promise<Config> {
-  const raw = await redis.get<Config>('config');
-  return typeof raw === 'string' ? JSON.parse(raw) : raw!;
-}
-
-function getMembershipAmounts(duration: string, config: Config) {
+function getMembershipAmounts(duration: MembershipDuration, config: Config) {
   const is1Year = duration === '1year';
   return {
     stakeOclt: is1Year ? (config.membershipStakeOclt1Year ?? 5000) : (config.membershipStakeOclt6Month ?? 1000),
     liquidOclt: is1Year ? (config.membershipLiquidOclt1Year ?? 2500) : (config.membershipLiquidOclt6Month ?? 2000),
     hbdTransfer: is1Year ? (config.membershipHbd1Year ?? 5) : (config.membershipHbd6Month ?? 0),
   };
-}
-
-async function callOffchainLu(path: string, options: RequestInit = {}): Promise<Response> {
-  const baseUrl = process.env.OFFCHAIN_LU_URL;
-  const apiKey = process.env.OCL_INTERNAL_API_KEY;
-  if (!baseUrl || !apiKey) throw new Error('OFFCHAIN_LU_URL or OCL_INTERNAL_API_KEY not configured');
-
-  return fetch(`${baseUrl}${path}`, {
-    ...options,
-    headers: {
-      'Content-Type': 'application/json',
-      'X-API-Key': apiKey,
-      ...(options.headers || {}),
-    },
-  });
-}
-
-async function sendAlert(subject: string, message: string): Promise<void> {
-  try {
-    await callOffchainLu('/api/notifications/send-alert', {
-      method: 'POST',
-      body: JSON.stringify({ subject, message }),
-    });
-  } catch (err) {
-    console.error('[MEMBERSHIP] Failed to send alert:', err);
-  }
 }
 
 // ── Main Inngest Function ──────────────────────────────────────────────
@@ -151,14 +52,14 @@ export const membershipProvision = inngest.createFunction(
       tx_id: string;
       stripe_customer_id: string;
       account_name: string;
-      duration: string;
+      duration: MembershipDuration;
       hive_amount: number;
       memo: string;
     };
 
     // ── Step 0: Mark as processing ──────────────────────────────────
     await step.run('set-processing', async () => {
-      await updateTxRecord(tx_id, { status: 'processing' });
+      await updateTxRecord('membership', tx_id, { status: 'processing' });
       console.log(`[MEMBERSHIP] Processing tx ${tx_id}: ${memo}`);
     });
 
@@ -212,7 +113,7 @@ export const membershipProvision = inngest.createFunction(
         ? `recovery_account is ${info.recovery_account} (expected ${creator} or offchain-lux)`
         : `created ${info.created} (before 2026, predates our account creation)`;
 
-      await updateTxRecord(tx_id, {
+      await updateTxRecord('membership', tx_id, {
         status: 'failed',
         error: `Account ${account_name} not ours: ${reason}`,
       });
@@ -250,7 +151,7 @@ export const membershipProvision = inngest.createFunction(
           memo: 'account creation fee',
         });
 
-        await updateTxRecord(tx_id, { fund_creator_tx_id: result.tx_id });
+        await updateTxRecord('membership', tx_id, { fund_creator_tx_id: result.tx_id });
         console.log(`[MEMBERSHIP] Funded ${creator} with ${fee} HIVE (tx ${result.tx_id})`);
       });
 
@@ -283,7 +184,7 @@ export const membershipProvision = inngest.createFunction(
           }));
         }
 
-        await updateTxRecord(tx_id, { account_creation_tx_id: data.tx_id || 'created' });
+        await updateTxRecord('membership', tx_id, { account_creation_tx_id: data.tx_id || 'created' });
         console.log(`[MEMBERSHIP] Account ${account_name} created`);
       });
 
@@ -305,189 +206,38 @@ export const membershipProvision = inngest.createFunction(
     const hiveForHbd = parseFloat((netHive * hbdPct).toFixed(3));
     const hiveForOclt = parseFloat((netHive * ocltPct).toFixed(3));
 
-    // Step 3a: Sell HIVE → HBD on internal market
-    const hbdExpected = await step.run('sell-hive-for-hbd', async () => {
-      if (hiveForHbd <= 0) return 0;
-
-      // We're selling HIVE to buy HBD — walk the ASKS (sellers of HBD)
-      // Asks are priced as "HBD per HIVE" — each ask says "I'll sell X HBD for Y HIVE"
-      const book = await getOrderBook(50);
-      let totalHive = 0;
-      let totalHbd = 0;
-
-      for (const ask of book.asks) {
-        const askHbd = ask.hbd;
-        const askHive = ask.hive;
-        const needed = hiveForHbd - totalHive;
-
-        if (needed <= 0) break;
-
-        if (askHive <= needed) {
-          totalHive += askHive;
-          totalHbd += askHbd;
-        } else {
-          const fraction = needed / askHive;
-          totalHive += needed;
-          totalHbd += askHbd * fraction;
-        }
-      }
-
-      if (totalHive < hiveForHbd * 0.5) {
-        throw new Error(`Order book too thin: only ${totalHive.toFixed(3)} HIVE depth vs ${hiveForHbd} needed`);
-      }
-
-      // VWAP: HBD per HIVE, then discount 0.5% for near-instant fill
-      const vwap = totalHbd / totalHive;
-      const minHbd = parseFloat((hiveForHbd * vwap * 0.995).toFixed(3));
-
-      const expiration = new Date(Date.now() + 60 * 60 * 1000).toISOString().slice(0, -5);
-      const orderId = makeRequestId(PAYMASTER, `membership-${tx_id}`);
-
-      const result = await broadcastLimitOrder({
-        owner: PAYMASTER,
-        order_id: orderId,
-        amount_to_sell: hive(hiveForHbd),
-        min_to_receive: hbd(minHbd),
-        fill_or_kill: false,
-        expiration,
-      });
-
-      await updateTxRecord(tx_id, { hbd_order_tx_id: result.tx_id });
-      console.log(`[MEMBERSHIP] Limit order: sell ${hiveForHbd} HIVE for ~${minHbd} HBD (tx ${result.tx_id})`);
-      return minHbd;
-    });
-
-    // Step 3b: Wait for order to fill
+    // Step 3a: Sell HIVE → HBD via chunked order-book walk
     if (hiveForHbd > 0) {
-      await step.sleep('wait-for-hbd-order', '5m');
-    }
+      await chunkedHbdSwap({
+        step,
+        namespace: 'membership',
+        txId: tx_id,
+        label: 'hbd',
+        hiveAmount: hiveForHbd,
+      });
 
-    // Step 3c: Stake HBD to savings (reserve hbdTransfer amount for member)
-    if (hbdExpected > 0) {
-      await step.run('stake-hbd-savings', async () => {
-        const liquidHbd = await getLiquidHbdBalance(PAYMASTER);
-        const toSavings = parseFloat((liquidHbd - hbdTransfer).toFixed(3));
-
-        if (toSavings <= 0) {
-          console.log(`[MEMBERSHIP] No HBD to stake to savings (liquid: ${liquidHbd}, reserve: ${hbdTransfer})`);
-          return;
-        }
-
-        // Route: ocl-paymaster savings if savings balance below threshold, else ocl-trez
-        const threshold = config.paymasterSavingsThreshold ?? 600;
-        const currentSavings = await getSavingsHbdBalance(PAYMASTER);
-        const savingsTarget = currentSavings < threshold ? PAYMASTER : (config.treasuryAccount ?? 'ocl-trez');
-
-        const result = await broadcastToSavings({
-          from: PAYMASTER,
-          to: savingsTarget,
-          amount: hbd(toSavings),
-          memo: `membership reserve: ${tx_id}`,
-        });
-
-        await updateTxRecord(tx_id, { hbd_savings_tx_id: result.tx_id });
-        console.log(`[MEMBERSHIP] Staked ${toSavings} HBD to ${savingsTarget} savings (tx ${result.tx_id})`);
+      // Step 3b: Route received HBD to savings, keeping `hbdTransfer` liquid
+      // on paymaster for the member transfer in Step 5c.
+      await hbdToSavings({
+        step,
+        namespace: 'membership',
+        txId: tx_id,
+        label: 'hbd-savings',
+        reserveHbd: hbdTransfer,
+        threshold: config.paymasterSavingsThreshold ?? 600,
+        treasuryAccount: config.treasuryAccount ?? 'ocl-trez',
       });
     }
 
-    // Step 3d: Wrap HIVE → SWAP.HIVE via @honey-swap
+    // Step 3c: Wrap HIVE → SWAP.HIVE then chunked AMM swap to OCLT
     if (hiveForOclt > 0) {
-      await step.run('wrap-hive-to-swap', async () => {
-        const result = await broadcastHiveTransfer({
-          from: PAYMASTER,
-          to: 'honey-swap',
-          amount: hive(hiveForOclt),
-          memo: HONEY_SWAP_MEMO,
-        });
-
-        await updateTxRecord(tx_id, { swap_hive_tx_id: result.tx_id });
-        console.log(`[MEMBERSHIP] HIVE → SWAP.HIVE: sent ${hiveForOclt} HIVE to @honey-swap (tx ${result.tx_id})`);
+      await wrapAndChunkedOcltSwap({
+        step,
+        namespace: 'membership',
+        txId: tx_id,
+        label: 'oclt',
+        hiveAmount: hiveForOclt,
       });
-
-      // Step 3e: Wait for wrap to settle
-      await step.sleep('wait-for-wrap', '30s');
-
-      // Step 3f: Chunked swap SWAP.HIVE → OCLT on Hive Engine AMM
-      // The OCLT pool is shallow — swap in chunks sized to keep price impact ≤ 2%.
-      // Between chunks, sleep to let arbitrageurs rebalance the pool.
-      const MAX_IMPACT = 0.02;
-      const MAX_CHUNKS = 20;
-      const CHUNK_COOLDOWN = '5m';
-      let swapRemaining = hiveForOclt;
-      let totalOcltReceived = 0;
-      let chunkIndex = 0;
-
-      while (swapRemaining > 0.001 && chunkIndex < MAX_CHUNKS) {
-        const chunkResult = await step.run(`swap-to-oclt-${chunkIndex}`, async () => {
-          const reserves = await getPoolReserves('SWAP.HIVE:OCLT');
-          const maxChunk = calculateMaxInputForImpact(reserves.baseQuantity, MAX_IMPACT);
-          const chunkSize = Math.min(swapRemaining, maxChunk);
-
-          // If the pool can absorb everything within impact, swap it all
-          const isLastChunk = chunkSize >= swapRemaining;
-          const actualChunk = parseFloat(chunkSize.toFixed(8));
-
-          const { expectedOut, minAmountOut } = calculateSwapOutput(
-            actualChunk,
-            reserves.baseQuantity,
-            reserves.quoteQuantity,
-            MAX_IMPACT,
-          );
-
-          const swapPayload = buildSwapPayload({
-            tokenPair: 'SWAP.HIVE:OCLT',
-            tokenSymbol: 'SWAP.HIVE',
-            tokenAmount: actualChunk.toFixed(8),
-            tradeType: 'exactInput',
-            minAmountOut: minAmountOut.toFixed(8),
-          });
-
-          const result = await broadcastCustomJson({
-            account: PAYMASTER,
-            id: 'ssc-mainnet-hive',
-            json: swapPayload,
-          });
-
-          console.log(
-            `[MEMBERSHIP] Swap chunk ${chunkIndex}: ${actualChunk.toFixed(4)} SWAP.HIVE → ~${expectedOut.toFixed(4)} OCLT` +
-            ` (impact ≤${(MAX_IMPACT * 100).toFixed(0)}%, ${isLastChunk ? 'final' : `${(swapRemaining - actualChunk).toFixed(4)} remaining`})` +
-            ` (tx ${result.tx_id})`,
-          );
-
-          return { swapped: actualChunk, expectedOclt: expectedOut, txId: result.tx_id };
-        });
-
-        swapRemaining = parseFloat((swapRemaining - chunkResult.swapped).toFixed(8));
-        totalOcltReceived += chunkResult.expectedOclt;
-
-        // Record the last swap tx_id
-        await step.run(`record-swap-tx-${chunkIndex}`, async () => {
-          await updateTxRecord(tx_id, { swap_oclt_tx_id: chunkResult.txId });
-        });
-
-        chunkIndex++;
-
-        // Sleep between chunks to let the pool rebalance (skip after last chunk)
-        if (swapRemaining > 0.001 && chunkIndex < MAX_CHUNKS) {
-          await step.sleep(`swap-cooldown-${chunkIndex}`, CHUNK_COOLDOWN);
-        }
-      }
-
-      if (swapRemaining > 0.001) {
-        console.warn(
-          `[MEMBERSHIP] Could not fully swap: ${swapRemaining.toFixed(4)} SWAP.HIVE remaining after ${MAX_CHUNKS} chunks. ` +
-          `Total OCLT received: ~${totalOcltReceived.toFixed(4)}`,
-        );
-        await step.run('alert-partial-swap', async () => {
-          await sendAlert(
-            'Membership: Partial OCLT swap',
-            `Only swapped ${(hiveForOclt - swapRemaining).toFixed(4)} of ${hiveForOclt.toFixed(4)} SWAP.HIVE after ${MAX_CHUNKS} chunks. ` +
-            `${swapRemaining.toFixed(4)} SWAP.HIVE left on ${PAYMASTER}. Tx: ${tx_id}, account: ${account_name}`,
-          );
-        });
-      } else {
-        console.log(`[MEMBERSHIP] Swap complete: ${chunkIndex} chunk(s), ~${totalOcltReceived.toFixed(4)} OCLT total`);
-      }
     }
 
     // ── Step 4: Check balances ──────────────────────────────────────
@@ -523,7 +273,7 @@ export const membershipProvision = inngest.createFunction(
         json: payload,
       });
 
-      await updateTxRecord(tx_id, { oclt_stake_tx_id: result.tx_id });
+      await updateTxRecord('membership', tx_id, { oclt_stake_tx_id: result.tx_id });
       console.log(`[MEMBERSHIP] Staked ${stakeOclt} OCLT to ${account_name} (tx ${result.tx_id})`);
     });
 
@@ -542,7 +292,7 @@ export const membershipProvision = inngest.createFunction(
         json: payload,
       });
 
-      await updateTxRecord(tx_id, { oclt_transfer_tx_id: result.tx_id });
+      await updateTxRecord('membership', tx_id, { oclt_transfer_tx_id: result.tx_id });
       console.log(`[MEMBERSHIP] Transferred ${liquidOclt} OCLT to ${account_name} (tx ${result.tx_id})`);
     });
 
@@ -556,7 +306,7 @@ export const membershipProvision = inngest.createFunction(
           memo: `Welcome to OCL! ${duration} membership HBD`,
         });
 
-        await updateTxRecord(tx_id, { hbd_transfer_tx_id: result.tx_id });
+        await updateTxRecord('membership', tx_id, { hbd_transfer_tx_id: result.tx_id });
         console.log(`[MEMBERSHIP] Transferred ${hbdTransfer} HBD to ${account_name} (tx ${result.tx_id})`);
       });
     }
@@ -583,12 +333,35 @@ export const membershipProvision = inngest.createFunction(
       }
 
       // Mark tx as processed
-      await updateTxRecord(tx_id, {
+      await updateTxRecord('membership', tx_id, {
         status: 'processed',
         processed_at: new Date().toISOString(),
       });
 
       console.log(`[MEMBERSHIP] Finalized tx ${tx_id}: ${account_name} provisioned`);
+    });
+
+    // ── Step 5f: Success notification to info@offchain.lu ──────────
+    await step.run('send-success-alert', async () => {
+      await sendAlert(
+        `Membership provisioned: ${account_name}`,
+        [
+          `Membership provisioning finalized.`,
+          ``,
+          `Account: ${account_name} (${accountWasCreated ? 'newly created' : 'pre-existing'})`,
+          `Duration: ${duration}`,
+          `Stripe customer: ${stripe_customer_id}`,
+          `HIVE received: ${hive_amount.toFixed(3)}`,
+          ``,
+          `Delivered to member:`,
+          `  Staked OCLT: ${stakeOclt}`,
+          `  Liquid OCLT: ${liquidOclt}`,
+          `  HBD transfer: ${hbdTransfer}`,
+          ``,
+          `Incoming tx: ${tx_id}`,
+          `Memo: ${memo}`,
+        ].join('\n'),
+      );
     });
 
     // ── Step 6: Send credentials (if account was created) ───────────
@@ -643,5 +416,112 @@ export const membershipProvision = inngest.createFunction(
       account_created: accountWasCreated,
       status: 'processed',
     };
+  },
+);
+
+// ── Education Provision ────────────────────────────────────────────────
+// Triggered by cron when a HIVE transfer lands with a
+// `cus_XXX:education:prod_XXX:...` memo. Unlike membership this workflow
+// does NOT create an account, transfer tokens to the buyer, or send
+// credentials — it just splits the HIVE 10/90, swaps both halves, routes
+// the HBD to savings, and accumulates OCLT on ocl-paymaster. Fulfilment
+// of the course purchase is the storefront's responsibility.
+
+export const educationProvision = inngest.createFunction(
+  { id: 'education-provision', retries: 12, triggers: [{ event: 'education/payment-received' }] },
+  async ({ event, step }) => {
+    const {
+      tx_id,
+      stripe_customer_id,
+      product_id,
+      hive_amount,
+      memo,
+    } = event.data as {
+      tx_id: string;
+      stripe_customer_id: string;
+      product_id: string;
+      hive_amount: number;
+      memo: string;
+    };
+
+    // ── Step 0: Mark as processing ──────────────────────────────────
+    await step.run('set-processing', async () => {
+      await updateTxRecord('education', tx_id, { status: 'processing' });
+      console.log(`[EDUCATION] Processing tx ${tx_id}: ${memo} (product ${product_id})`);
+    });
+
+    // ── Step 1: Read config for split + savings routing ────────────
+    const config = await step.run('read-config', async () => {
+      return getConfig();
+    }) as Config;
+
+    const hbdPct = (config.hiveToHbdPct ?? 90) / 100;
+    const ocltPct = (config.hiveToOcltPct ?? 10) / 100;
+    const hiveForHbd = parseFloat((hive_amount * hbdPct).toFixed(3));
+    const hiveForOclt = parseFloat((hive_amount * ocltPct).toFixed(3));
+
+    // ── Step 2: Sell HIVE → HBD via chunked order-book walk ────────
+    if (hiveForHbd > 0) {
+      await chunkedHbdSwap({
+        step,
+        namespace: 'education',
+        txId: tx_id,
+        label: 'hbd',
+        hiveAmount: hiveForHbd,
+      });
+
+      // Route HBD to savings (paymaster if below threshold, else treasury).
+      // Education keeps no HBD liquid — reserveHbd: 0.
+      await hbdToSavings({
+        step,
+        namespace: 'education',
+        txId: tx_id,
+        label: 'hbd-savings',
+        reserveHbd: 0,
+        threshold: config.paymasterSavingsThreshold ?? 600,
+        treasuryAccount: config.treasuryAccount ?? 'ocl-trez',
+      });
+    }
+
+    // ── Step 3: Wrap HIVE → SWAP.HIVE then chunked AMM swap to OCLT ─
+    if (hiveForOclt > 0) {
+      await wrapAndChunkedOcltSwap({
+        step,
+        namespace: 'education',
+        txId: tx_id,
+        label: 'oclt',
+        hiveAmount: hiveForOclt,
+      });
+    }
+
+    // ── Step 4: Finalize ───────────────────────────────────────────
+    await step.run('finalize', async () => {
+      await updateTxRecord('education', tx_id, {
+        status: 'processed',
+        processed_at: new Date().toISOString(),
+      });
+      console.log(`[EDUCATION] Finalized tx ${tx_id}: product ${product_id}`);
+    });
+
+    // ── Step 5: Success notification to info@offchain.lu ───────────
+    await step.run('send-success-alert', async () => {
+      await sendAlert(
+        `Education sale processed: ${product_id}`,
+        [
+          `Education purchase finalized.`,
+          ``,
+          `Stripe customer: ${stripe_customer_id}`,
+          `Product: ${product_id}`,
+          `HIVE received: ${hive_amount.toFixed(3)}`,
+          `  → HBD swap: ${hiveForHbd.toFixed(3)} HIVE (routed to savings)`,
+          `  → OCLT swap: ${hiveForOclt.toFixed(3)} HIVE (accumulated on ${PAYMASTER})`,
+          ``,
+          `Incoming tx: ${tx_id}`,
+          `Memo: ${memo}`,
+        ].join('\n'),
+      );
+    });
+
+    return { tx_id, product_id, hive_amount, status: 'processed' };
   },
 );

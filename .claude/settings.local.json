@@ -2,7 +2,11 @@
   "permissions": {
     "allow": [
       "Bash(npm install:*)",
-      "Bash(grep -E \"\\\\.\\(tsx|ts\\)$\")"
+      "Bash(grep -E \"\\\\.\\(tsx|ts\\)$\")",
+      "Read(//c/Users/Sorin/Documents/GitHub/OffChain/website/src/**)",
+      "Read(//c/Users/Sorin/Documents/GitHub/OffChain/website/**)",
+      "Read(//c/Users/Sorin/.claude/plans//**)",
+      "Read(//c/Users/Sorin/.claude//**)"
     ]
   }
 }

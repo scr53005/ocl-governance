@@ -17,7 +17,14 @@ try {
     const eqIndex = trimmed.indexOf('=');
     if (eqIndex === -1) continue;
     const key = trimmed.slice(0, eqIndex).trim();
-    const value = trimmed.slice(eqIndex + 1).trim();
+    let value = trimmed.slice(eqIndex + 1).trim();
+    // Strip matching surrounding quotes — standard dotenv behaviour.
+    if (
+      (value.startsWith('"') && value.endsWith('"')) ||
+      (value.startsWith("'") && value.endsWith("'"))
+    ) {
+      value = value.slice(1, -1);
+    }
     if (!process.env[key]) process.env[key] = value;
   }
 } catch {
@@ -36,6 +43,23 @@ async function seed() {
 
   const redis = new Redis({ url, token });
 
+  // Safety banner — make it impossible to seed the wrong DB by accident.
+  // Prints the host of the Upstash REST URL so dev vs prod is visually
+  // obvious before anything is written. Set GOV_KV_ENV in .env.local
+  // (e.g. "dev", "prod") for an extra human-readable label.
+  let host = url;
+  try {
+    host = new URL(url).host;
+  } catch {
+    // leave as-is if url is malformed
+  }
+  const envLabel = process.env.GOV_KV_ENV || '(unlabelled)';
+  console.log('─'.repeat(60));
+  console.log('  Seeding Upstash Redis');
+  console.log(`  Host:  ${host}`);
+  console.log(`  Label: ${envLabel}`);
+  console.log('─'.repeat(60));
+
   console.log('Seeding config into KV store...');
   await redis.set('config', config);
   console.log('Config seeded successfully.');
@@ -49,15 +73,31 @@ async function seed() {
     console.log('Projections key already exists, skipping.');
   }
 
-  // Memo routing table (idempotent — only set if not present)
-  const existingRoutes = await redis.get('memo_routes');
-  if (!existingRoutes) {
-    await redis.set('memo_routes', JSON.stringify([
-      { keyword: 'membership', event: 'membership/payment-received', active: true },
-    ]));
-    console.log('Seeded memo_routes.');
+  // Memo routing table — merge desired routes into whatever's already
+  // there so adding a new route doesn't clobber existing ones (e.g. if
+  // someone has toggled `active: false` on a route, we preserve it).
+  type MemoRoute = { keyword: string; event: string; active: boolean };
+  const desiredRoutes: MemoRoute[] = [
+    { keyword: 'membership', event: 'membership/payment-received', active: true },
+    { keyword: 'education',  event: 'education/payment-received',  active: true },
+  ];
+
+  const existingRoutesRaw = await redis.get('memo_routes');
+  if (!existingRoutesRaw) {
+    await redis.set('memo_routes', JSON.stringify(desiredRoutes));
+    console.log(`Seeded memo_routes with ${desiredRoutes.length} route(s): ${desiredRoutes.map((r) => r.keyword).join(', ')}.`);
   } else {
-    console.log('memo_routes already exists, skipping.');
+    const existingRoutes: MemoRoute[] = typeof existingRoutesRaw === 'string'
+      ? JSON.parse(existingRoutesRaw)
+      : (existingRoutesRaw as MemoRoute[]);
+    const known = new Set(existingRoutes.map((r) => r.keyword));
+    const additions = desiredRoutes.filter((r) => !known.has(r.keyword));
+    if (additions.length > 0) {
+      await redis.set('memo_routes', JSON.stringify([...existingRoutes, ...additions]));
+      console.log(`Merged new routes into memo_routes: ${additions.map((r) => r.keyword).join(', ')}.`);
+    } else {
+      console.log('memo_routes already contains all desired routes, skipping.');
+    }
   }
 
   // Transfer scanner cursor (idempotent)
