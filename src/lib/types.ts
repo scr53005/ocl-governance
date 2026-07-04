@@ -117,6 +117,87 @@ export type EducationTxRecord = BaseTxRecord & {
 
 export type TxRecord = MembershipTxRecord | EducationTxRecord;
 
+// ── Funding record (Redis key: "funding:tx:<stripeCustomerId>") ──────
+// The OUTBOUND half of membership automation: spend the business's EUR
+// float on Binance to buy HIVE, then withdraw that HIVE to `ocl-paymaster`
+// with the membership memo. Once the HIVE lands on chain, the existing
+// cron → `membership/payment-received` → membership-provision pipeline
+// takes over. This record is the funding leg's own audit + idempotency
+// trail; it is NOT a memo-triggered inbound TxRecord and is not part of
+// the cron's ROUTE_VALIDATORS.
+
+export type FundingStatus =
+  | 'pending'       // event received, nothing spent yet
+  | 'processing'    // EUR/USDC/HIVE legs in flight
+  | 'withdrawn'     // HIVE withdrawal confirmed on Binance side
+  | 'processed'     // fully done (withdrawal landed) — cron will pick up the arrival
+  | 'needs_review'  // stopped early (insufficient balance, thin book, timeout)
+  | 'failed';
+
+export type FundingBuyChunk = {
+  index: number;
+  usdc_spent: number;
+  hive_obtained: number;
+  order_id: string | null;
+  slippage_bps: number;
+};
+
+export type FundingTxRecord = {
+  status: FundingStatus;
+  stripe_customer_id: string;
+  memo: string;
+  account_name: string;
+  duration: MembershipDuration;
+  // Economics (all numbers, matching the rest of this app)
+  eur_requested: number;
+  eur_spent: number;
+  usdc_obtained: number;
+  buy_chunks: FundingBuyChunk[];
+  hive_obtained: number;        // gross HIVE bought on Binance
+  hive_withdrawal_fee: number;  // Binance network fee (default 0.1 HIVE)
+  net_hive: number;             // amount actually withdrawn to ocl-paymaster
+  // Withdrawal identifiers
+  withdraw_order_id: string;    // deterministic — the double-spend guard
+  withdraw_binance_id: string | null;
+  withdraw_tx_id: string | null; // on-chain Hive tx id, once completed
+  // Timestamps
+  created_at: string;
+  processed_at: string | null;
+  error: string | null;
+};
+
+export type NewFundingTxRecordInit = {
+  stripe_customer_id: string;
+  memo: string;
+  account_name: string;
+  duration: MembershipDuration;
+  eur_requested: number;
+  withdraw_order_id: string;
+};
+
+export function newFundingTxRecord(init: NewFundingTxRecordInit): FundingTxRecord {
+  return {
+    status: 'pending',
+    stripe_customer_id: init.stripe_customer_id,
+    memo: init.memo,
+    account_name: init.account_name,
+    duration: init.duration,
+    eur_requested: init.eur_requested,
+    eur_spent: 0,
+    usdc_obtained: 0,
+    buy_chunks: [],
+    hive_obtained: 0,
+    hive_withdrawal_fee: 0,
+    net_hive: 0,
+    withdraw_order_id: init.withdraw_order_id,
+    withdraw_binance_id: null,
+    withdraw_tx_id: null,
+    created_at: new Date().toISOString(),
+    processed_at: null,
+    error: null,
+  };
+}
+
 // ── Factories ────────────────────────────────────────────────────────
 // Take only the fields the cron knows at creation time; default all
 // downstream workflow outputs to null / empty arrays.

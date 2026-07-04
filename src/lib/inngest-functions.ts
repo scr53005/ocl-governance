@@ -23,17 +23,7 @@ import {
   wrapAndChunkedOcltSwap,
   hbdToSavings,
 } from './workflow-helpers';
-
-// ── Membership-specific helper ─────────────────────────────────────────
-
-function getMembershipAmounts(duration: MembershipDuration, config: Config) {
-  const is1Year = duration === '1year';
-  return {
-    stakeOclt: is1Year ? (config.membershipStakeOclt1Year ?? 5000) : (config.membershipStakeOclt6Month ?? 1000),
-    liquidOclt: is1Year ? (config.membershipLiquidOclt1Year ?? 2500) : (config.membershipLiquidOclt6Month ?? 2000),
-    hbdTransfer: is1Year ? (config.membershipHbd1Year ?? 5) : (config.membershipHbd6Month ?? 0),
-  };
-}
+import { resolveMembershipGrants, isRenewal } from './membership-math';
 
 // ── Main Inngest Function ──────────────────────────────────────────────
 
@@ -64,16 +54,25 @@ export const membershipProvision = inngest.createFunction(
     });
 
     // ── Step 1: Lookup customer record ──────────────────────────────
-    await step.run('lookup-customer', async () => {
+    // We also read `hiveAccountCreated` here: the value "skipped_renewal"
+    // marks a RENEWAL (existing member paying again), which changes what the
+    // member receives downstream. The on-chain memo is identical for new vs
+    // renewal, so the customer record is the only place this is knowable.
+    const lookup = await step.run('lookup-customer', async () => {
       const raw = await redis.get<CustomerRecord>(`customer:${stripe_customer_id}`);
       if (!raw) {
         console.warn(`[MEMBERSHIP] No customer record for ${stripe_customer_id}, proceeding anyway`);
-        return null;
+        return { hiveAccountCreated: null as string | null };
       }
       const record: CustomerRecord = typeof raw === 'string' ? JSON.parse(raw) : raw;
       console.log(`[MEMBERSHIP] Customer: ${record.firstName} ${record.lastName} (${record.email})`);
-      return record;
+      return { hiveAccountCreated: record.hiveAccountCreated ?? null };
     });
+
+    const renewal = isRenewal(lookup.hiveAccountCreated);
+    if (renewal) {
+      console.log(`[MEMBERSHIP] ${account_name} is a RENEWAL — member grants (OCLT stake/transfer, HBD) will be skipped; HIVE conversion runs as usual.`);
+    }
 
     // ── Step 2: Verify/create Hive account ────────────────────────────
     // IMPORTANT: If account exists, verify it's ours (recovery_account = offchain-lux).
@@ -134,6 +133,24 @@ export const membershipProvision = inngest.createFunction(
         status: 'failed',
         reason: 'account_name_collision',
       };
+    }
+
+    // A renewal implies the member's account already exists. If it somehow
+    // doesn't, that's an inconsistency (offchain.lu marked "skipped_renewal"
+    // for a missing account) — do NOT create it silently; stop and alert.
+    if (renewal && accountStatus === 'needs_creation') {
+      await step.run('renewal-missing-account', async () => {
+        await updateTxRecord('membership', tx_id, {
+          status: 'failed',
+          error: `Renewal for ${account_name} but account does not exist`,
+        });
+        await sendAlert(
+          'Membership: renewal for missing account',
+          `Customer ${stripe_customer_id} is marked as a renewal (skipped_renewal) but Hive account ` +
+          `"${account_name}" does not exist. Tx: ${tx_id}. Manual intervention required.`,
+        );
+      });
+      return { tx_id, account_name, status: 'failed', reason: 'renewal_account_missing' };
     }
 
     let accountWasCreated = false;
@@ -197,7 +214,10 @@ export const membershipProvision = inngest.createFunction(
       return getConfig();
     }) as Config;
 
-    const { stakeOclt, liquidOclt, hbdTransfer } = getMembershipAmounts(duration, config);
+    // Renewals deliver ZERO member grants (no OCLT stake/transfer, no HBD) —
+    // the HIVE conversion below still runs identically. New members get the
+    // full duration-based grant.
+    const { stakeOclt, liquidOclt, hbdTransfer } = resolveMembershipGrants(duration, config, renewal);
 
     const creationFee = accountWasCreated ? (config.accountCreationFee ?? 3) : 0;
     const netHive = hive_amount - creationFee;
@@ -241,60 +261,67 @@ export const membershipProvision = inngest.createFunction(
     }
 
     // ── Step 4: Check balances ──────────────────────────────────────
-    await step.run('check-balances', async () => {
-      const ocltBalance = await getBalance(PAYMASTER, 'OCLT');
-      const liquidOcltAvailable = parseFloat(ocltBalance.balance);
-      const needed = stakeOclt + liquidOclt;
+    // Only relevant when we actually deliver OCLT (skipped for renewals).
+    if (stakeOclt + liquidOclt > 0) {
+      await step.run('check-balances', async () => {
+        const ocltBalance = await getBalance(PAYMASTER, 'OCLT');
+        const liquidOcltAvailable = parseFloat(ocltBalance.balance);
+        const needed = stakeOclt + liquidOclt;
 
-      if (liquidOcltAvailable < needed) {
-        await sendAlert(
-          'Membership: Insufficient OCLT',
-          `Need ${needed} OCLT (stake: ${stakeOclt}, liquid: ${liquidOclt}) but only have ${liquidOcltAvailable}. Tx: ${tx_id}, account: ${account_name}`,
-        );
-        throw new Error(`Insufficient OCLT: need ${needed}, have ${liquidOcltAvailable}`);
-      }
+        if (liquidOcltAvailable < needed) {
+          await sendAlert(
+            'Membership: Insufficient OCLT',
+            `Need ${needed} OCLT (stake: ${stakeOclt}, liquid: ${liquidOclt}) but only have ${liquidOcltAvailable}. Tx: ${tx_id}, account: ${account_name}`,
+          );
+          throw new Error(`Insufficient OCLT: need ${needed}, have ${liquidOcltAvailable}`);
+        }
 
-      console.log(`[MEMBERSHIP] Balance check OK: ${liquidOcltAvailable} OCLT available, need ${needed}`);
-    });
+        console.log(`[MEMBERSHIP] Balance check OK: ${liquidOcltAvailable} OCLT available, need ${needed}`);
+      });
+    }
 
     // ── Step 5: Provision member ────────────────────────────────────
 
-    // 5a: Stake OCLT to member
-    await step.run('stake-oclt', async () => {
-      const payload = buildStakePayload(
-        account_name,
-        'OCLT',
-        stakeOclt.toFixed(3),
-      );
+    // 5a: Stake OCLT to member (skipped for renewals — grant is 0)
+    if (stakeOclt > 0) {
+      await step.run('stake-oclt', async () => {
+        const payload = buildStakePayload(
+          account_name,
+          'OCLT',
+          stakeOclt.toFixed(3),
+        );
 
-      const result = await broadcastCustomJson({
-        account: PAYMASTER,
-        id: 'ssc-mainnet-hive',
-        json: payload,
+        const result = await broadcastCustomJson({
+          account: PAYMASTER,
+          id: 'ssc-mainnet-hive',
+          json: payload,
+        });
+
+        await updateTxRecord('membership', tx_id, { oclt_stake_tx_id: result.tx_id });
+        console.log(`[MEMBERSHIP] Staked ${stakeOclt} OCLT to ${account_name} (tx ${result.tx_id})`);
       });
+    }
 
-      await updateTxRecord('membership', tx_id, { oclt_stake_tx_id: result.tx_id });
-      console.log(`[MEMBERSHIP] Staked ${stakeOclt} OCLT to ${account_name} (tx ${result.tx_id})`);
-    });
+    // 5b: Transfer liquid OCLT to member (skipped for renewals — grant is 0)
+    if (liquidOclt > 0) {
+      await step.run('transfer-oclt', async () => {
+        const payload = buildTokenTransferPayload(
+          account_name,
+          'OCLT',
+          liquidOclt.toFixed(3),
+          `Welcome to OCL! ${duration} membership`,
+        );
 
-    // 5b: Transfer liquid OCLT to member
-    await step.run('transfer-oclt', async () => {
-      const payload = buildTokenTransferPayload(
-        account_name,
-        'OCLT',
-        liquidOclt.toFixed(3),
-        `Welcome to OCL! ${duration} membership`,
-      );
+        const result = await broadcastCustomJson({
+          account: PAYMASTER,
+          id: 'ssc-mainnet-hive',
+          json: payload,
+        });
 
-      const result = await broadcastCustomJson({
-        account: PAYMASTER,
-        id: 'ssc-mainnet-hive',
-        json: payload,
+        await updateTxRecord('membership', tx_id, { oclt_transfer_tx_id: result.tx_id });
+        console.log(`[MEMBERSHIP] Transferred ${liquidOclt} OCLT to ${account_name} (tx ${result.tx_id})`);
       });
-
-      await updateTxRecord('membership', tx_id, { oclt_transfer_tx_id: result.tx_id });
-      console.log(`[MEMBERSHIP] Transferred ${liquidOclt} OCLT to ${account_name} (tx ${result.tx_id})`);
-    });
+    }
 
     // 5c: Transfer HBD (1-year only)
     if (hbdTransfer > 0) {
@@ -344,19 +371,21 @@ export const membershipProvision = inngest.createFunction(
     // ── Step 5f: Success notification to info@offchain.lu ──────────
     await step.run('send-success-alert', async () => {
       await sendAlert(
-        `Membership provisioned: ${account_name}`,
+        `Membership ${renewal ? 'renewed' : 'provisioned'}: ${account_name}`,
         [
-          `Membership provisioning finalized.`,
+          `Membership ${renewal ? 'renewal' : 'provisioning'} finalized.`,
           ``,
-          `Account: ${account_name} (${accountWasCreated ? 'newly created' : 'pre-existing'})`,
+          `Account: ${account_name} (${renewal ? 'renewal — pre-existing' : accountWasCreated ? 'newly created' : 'pre-existing'})`,
           `Duration: ${duration}`,
           `Stripe customer: ${stripe_customer_id}`,
           `HIVE received: ${hive_amount.toFixed(3)}`,
           ``,
-          `Delivered to member:`,
-          `  Staked OCLT: ${stakeOclt}`,
-          `  Liquid OCLT: ${liquidOclt}`,
-          `  HBD transfer: ${hbdTransfer}`,
+          renewal ? `Renewal — no fresh OCLT/HBD delivered to member.` : `Delivered to member:`,
+          ...(renewal ? [] : [
+            `  Staked OCLT: ${stakeOclt}`,
+            `  Liquid OCLT: ${liquidOclt}`,
+            `  HBD transfer: ${hbdTransfer}`,
+          ]),
           ``,
           `Incoming tx: ${tx_id}`,
           `Memo: ${memo}`,
@@ -414,6 +443,7 @@ export const membershipProvision = inngest.createFunction(
       duration,
       hive_amount,
       account_created: accountWasCreated,
+      renewal,
       status: 'processed',
     };
   },

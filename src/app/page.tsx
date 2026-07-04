@@ -41,6 +41,12 @@ export default function HomePage() {
           >
             Reserve Ratio
           </Link>
+          <Link
+            href="/provisioning"
+            className="bg-indigo-600 hover:bg-indigo-700 text-white font-semibold py-3 px-6 rounded-lg shadow-md transition-colors duration-200 text-lg w-full sm:w-auto text-center"
+          >
+            Member Provisioning
+          </Link>
         </div>
       </div>
     </div>

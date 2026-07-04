@@ -19,11 +19,44 @@ When HIVE arrives on `ocl-paymaster` with a membership memo (e.g., `cus_XXX:memb
 3. **Provisions the member** — stakes OCLT, transfers liquid OCLT + HBD, registers in governance.
 4. **Emails `info@offchain.lu`** with a success summary and, if the account was newly created, emails the member their seed/master password.
 
+**New members vs. renewals.** A **renewal** (an existing member paying again) is detected from the customer record's `hiveAccountCreated === "skipped_renewal"` (the on-chain memo is identical for both, so the customer record is the only signal). A renewal **skips** account creation and the member grants — **no fresh OCLT stake/transfer and no HBD transfer to the member** — but the HIVE conversion (step 2: HBD→savings + OCLT accumulation) runs **identically**, since it's driven by the received HIVE, not the grant amounts. The new-vs-renewal grant logic is the pure, unit-tested `resolveMembershipGrants` in `src/lib/membership-math.ts`.
+
+**Duration labels vs. the memo.** The customer record labels the annual plan `"12months"` (and the six-month plan `"6months"`), but the payment-memo convention and the cron validator only accept `"1year"` / `"6months"`. Any code that **constructs** a membership memo (the funding workflow, the trigger script) or filters the customer list normalizes the label through `normalizeDuration` in `src/lib/membership-math.ts` (`"12months" → "1year"`); an unrecognized label returns `null` and doubles as the membership-vs-education discriminator. `membership-provision` itself only ever receives the already-validated canonical duration from the cron.
+
 ### Automated Education Sales
 
 When HIVE arrives on `ocl-paymaster` with an education memo (e.g., `cus_XXX:education:prod_XXX:0`), a leaner workflow splits the HIVE 90/10, runs the same chunked HBD + OCLT swaps as membership, routes the HBD to savings (paymaster or treasury based on the same threshold), and accumulates the OCLT on `ocl-paymaster`. **No** account creation, token transfer, or credential delivery — fulfilment of the course purchase is the storefront's responsibility. A success summary is emailed to `info@offchain.lu` on finalize.
 
 **Architecture:** Vercel Cron (every 5min) scans `ocl-paymaster` transfer history, a route-aware parser classifies each memo by keyword, and the matching Inngest durable function handles the multi-step workflow with automatic retries. Cross-app integration with [offchain.lu](https://www.offchain.lu) via shared Upstash Redis and authenticated API endpoints (account creation, credentials email, admin notifications).
+
+### Automated Membership Funding (outbound EUR → HIVE)
+
+The **inbound** half above starts once HIVE lands on `ocl-paymaster`. The **funding** half puts it there automatically: instead of a human manually sending HIVE, the `fund-membership` Inngest workflow spends the business's Binance **EUR** float to buy HIVE and withdraws it to `ocl-paymaster` **with the membership memo on the withdrawal's `addressTag`**. That memo lands on chain as the transfer memo, so the existing cron → `membership/payment-received` → `membership-provision` pipeline picks it up with zero glue. The funding workflow's job ends at "withdrawal completed"; it never provisions.
+
+Flow (triggered by the `membership/funding-requested` event):
+
+1. **Check EUR balance** on Binance (via the executor's `outbound` profile). Abort → `needs_review` if below the requested amount.
+2. **EUR → USDC** — single `EURUSDC` LIMIT IOC sell for the fundable amount.
+3. **USDC → HIVE** — chunked `HIVEUSDC` LIMIT IOC buys under a per-chunk slippage cap (default 50 bps, 20-chunk circuit breaker).
+4. **Withdraw HIVE → `ocl-paymaster`** with `addressTag = <membership memo>` and a **deterministic `withdrawOrderId` (`ocl-fund-<customerId>`)** so a replay/retry can never double-withdraw. Poll Binance withdraw-history to completion.
+5. Email `info@offchain.lu` a funding summary. The 5-min cron then detects the arrival and fires provisioning.
+
+The **fundable EUR amount** is `gross membership price − Stripe fee − Binance fiat-deposit fee`, per plan: 6-month `60 − 1.57 − 1 = 57.43 €`, annual `100 − 4.85 − 1 = 94.15 €`. The Binance deposit fee is flat but the **Stripe fee varies per transaction** (card type/country), so `MEMBERSHIP_PRICING` in `funding-math.ts` stores the fee Stripe actually charged per plan — these are a **prefill only**; the operator enters/overrides the real € (the amount they moved to Binance) in the UI or via `--eur`. The amount is passed on the event, not hardcoded in the workflow.
+
+**Binance boundary:** all signed Binance calls go through the **VPS executor** at a static IPv4 (`EXECUTOR_BASE_URL`) — the *same* executor [hbdfiat](../hbdfiat) uses, reusing its `outbound` credential profile. Vercel egress IPs are not whitelisted on the Binance keys, so the app can never call Binance directly. `src/lib/executor.ts` is a thin HTTP client ported from hbdfiat.
+
+**Cross-run safety:** Inngest step-memoization only dedups *within* one run. If a prior run partially executed and the event is re-sent, the workflow **blocks** (alerts, refuses to re-spend) unless the operator inspects `funding:tx:<customerId>` and re-sends with `force=true`. Only the withdrawal is idempotent across runs.
+
+**Trigger (one-off, operator-run):**
+```powershell
+npx tsx scripts/trigger-funding.ts cus_XXXX            # dry-run — prints the plan, sends nothing
+npx tsx scripts/trigger-funding.ts cus_XXXX --send     # dispatch (spends REAL EUR, withdraws REAL HIVE)
+npx tsx scripts/trigger-funding.ts cus_XXXX --eur 117.43 --send   # override the amount
+```
+
+**Or from the UI** — the **Member Provisioning** page (`/provisioning`, linked from the home page) lists membership customers who have paid but aren't yet provisioned (`customer:*` with `provisionedAt == null` and a membership duration — education records, which never carry a duration, are excluded). Each row shows new-vs-renewal, a €-to-spend input (prefilled with the computed fundable amount), and its live funding status (joined from `funding:tx:*`, so a row that's already funding shows status instead of a button and can't be double-clicked). "Start provisioning" POSTs to `/api/ops/fund-membership`, which sanitizes the € (1–1000, 2 dp), refuses if already provisioned or funding is in flight, and sends `membership/funding-requested`. `GET /api/ops/pending-members` backs the list.
+
+> ⚠️ **No auth yet.** The provisioning page and its API routes are currently **open** (marked `TODO(auth)`). Operator authentication is being handled as part of the offchain.lu ↔ ocl-governance merge; gate these before that merge ships, since `POST /api/ops/fund-membership` spends real money.
 
 ## Payment Workflows
 
@@ -148,6 +181,11 @@ INNGEST_SIGNING_KEY=...                # Inngest signing key (preview)
 INNGEST_DEV=1                          # Required for local Inngest dev server
 OCL_INTERNAL_API_KEY=...               # Shared secret for cross-app auth
 OFFCHAIN_LU_URL=https://www.offchain.lu  # Website API base URL
+
+# Membership funding (outbound EUR → HIVE via Binance)
+EXECUTOR_BASE_URL=https://api.converthbdeur.offchain.lu  # VPS Binance executor (static IPv4). Optional — this is the default.
+EXECUTOR_API_KEY=...                   # Bearer token for the executor (same executor hbdfiat uses)
+BINANCE_HIVE_WITHDRAWAL_FEE=0.1        # Optional — Binance HIVE network withdrawal fee, in HIVE (default 0.1)
 ```
 
 **Dev environment note.** For local testing, run against a **separate dev Upstash instance** (create a second DB in the Upstash console and point `GOV_KV_REST_API_URL` / `GOV_KV_REST_API_TOKEN` at it in `.env.local`) and a **separate dev Hive account** (e.g. `decent-tester`) by setting `HIVE_PAYMASTER_ACCOUNT` and `HIVE_ACTIVE_KEY_PAYMASTER` accordingly. This keeps dev transfers, TxRecords, and cursor state fully isolated from prod. In Vercel, `HIVE_PAYMASTER_ACCOUNT` should either be **unset** (code falls back to `ocl-paymaster`) or **explicitly set to `ocl-paymaster`** — never to a dev account.
@@ -161,6 +199,17 @@ npx next dev --port 3100    # dev server at http://localhost:3100
 ```
 
 (Port 3100 is the project convention — port 3000 is reserved for a sibling app.)
+
+### Testing
+
+One command runs the whole unit suite:
+
+```bash
+npm test          # vitest run — the full suite
+npm run test:watch
+```
+
+`vitest.config.ts` includes `src/**/*.test.ts` and `tests/**/*.test.ts`, so new test files are picked up automatically. Keep any lib file that ends up in a test (or a `tsx` script) on **relative** imports — Vitest and `tsx` resolve via Node, not the Next bundler, so the `@/…` alias fails at test/script runtime. That's why the funding workflow's pure logic lives in `src/lib/funding-math.ts` (no I/O, relative imports only) with `funding-math.test.ts` alongside it.
 
 ### Local Inngest Development
 
@@ -191,12 +240,15 @@ src/
   app/
     debt/page.tsx                        Reserve ratio + projection table
     voting/page.tsx                      Governance voting simulator
+    provisioning/page.tsx                Member Provisioning UI (list + start funding)
     api/
       config/route.ts                    GET config from Redis
       projections/route.ts               CRUD for projection rows
       stakes/route.ts                    Member stake distribution
       cron/scan-transfers/route.ts       Cron: scan ocl-paymaster transfers
       inngest/route.ts                   Inngest serve endpoint
+      ops/pending-members/route.ts       GET membership customers needing provisioning
+      ops/fund-membership/route.ts       POST — start the funding workflow for one customer
   components/
     ProjectionTable.tsx                  Interactive projection table (client)
     VotingInner.tsx                      Voting UI (client)
@@ -206,15 +258,23 @@ src/
     hive.ts                              Hive blockchain API (read + write)
     hive-engine.ts                       Hive Engine token API (read + write)
     ecb.ts                               ECB exchange rate API
+    executor.ts                          VPS Binance executor HTTP client (funding leg)
     inngest.ts                           Inngest client singleton
-    types.ts                             Shared types + TxRecord factories (discriminated union)
+    types.ts                             Shared types + TxRecord/FundingTxRecord factories
     workflow-helpers.ts                  Chunked HBD/OCLT swaps, savings routing, alerts, Redis helpers
-    inngest-functions.ts                 Membership + education provisioning workflows
+    inngest-functions.ts                 Membership + education provisioning workflows (new + renewal)
+    funding-functions.ts                 fund-membership workflow (EUR → HIVE via Binance → ocl-paymaster)
+    funding-math.ts                      Pure funding helpers (fundable EUR, floor, buy-plan gating) — unit-tested
+    funding-math.test.ts                 Vitest unit tests for funding-math
+    membership-math.ts                   Pure membership grant logic (new vs renewal) — unit-tested
+    membership-math.test.ts              Vitest unit tests for membership-math
 scripts/
   seed-kv.ts                             Config + memo routes seed script (with dev/prod safety banner)
   seed-dev-customer.ts                   Seed fake CustomerRecord fixtures into dev Redis (refuses prod without --force)
   set-cursor.ts                          Advance/reset the paymaster-wide scan cursor (membership:last_tx_id)
   backfill-customers.ts                  Backfill customer records into Redis
+  inspect-customer.ts                    Read-only dump of one customer record from Redis
+  trigger-funding.ts                     Dispatch the fund-membership workflow (dry-run by default)
   list-our-accounts.ts                   Audit Hive accounts owned by offchain-lux
 config.json                              Base configuration (seeded to Redis)
 vercel.json                              Cron schedule configuration
