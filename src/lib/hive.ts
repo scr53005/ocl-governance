@@ -228,6 +228,28 @@ export async function broadcastLimitOrder(params: {
   return { tx_id: result.id, op_count: 1 };
 }
 
+/** Sign and broadcast a limit_order_cancel (removes a resting order by orderid). */
+export async function broadcastLimitOrderCancel(params: {
+  owner: string;
+  order_id: number;
+}): Promise<BroadcastResult> {
+  const key = getActiveKey();
+  const baseTx = await getBaseTransaction();
+
+  const tx: Transaction = {
+    ...baseTx,
+    operations: [['limit_order_cancel', {
+      owner: params.owner,
+      orderid: params.order_id,
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    }] as any],
+  };
+
+  const signed = hiveClient.broadcast.sign(tx, [key]);
+  const result = await hiveClient.broadcast.send(signed);
+  return { tx_id: result.id, op_count: 1 };
+}
+
 /** Sign and broadcast a transfer (HIVE or HBD). */
 export async function broadcastHiveTransfer(params: {
   from: string;

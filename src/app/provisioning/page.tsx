@@ -12,6 +12,7 @@ type PendingMember = {
   rawMembershipType: string;
   isRenewal: boolean;
   fundingStatus: string | null;
+  provisioningStatus: string | null;
   defaultEur: number | null;
   createdAt: string;
 };
@@ -20,9 +21,18 @@ const FUNDING_LABEL: Record<string, string> = {
   pending: 'Funding queued…',
   processing: 'Funding in progress…',
   withdrawn: 'HIVE withdrawn — awaiting cron',
-  processed: 'Funded — awaiting provisioning',
+  processed: 'HIVE delivered — awaiting cron',
   needs_review: 'Needs review (see alerts / script)',
   failed: 'Failed (see alerts / script)',
+};
+
+// Downstream membership-provision status (once the HIVE has landed and the
+// cron fired). Takes precedence over the funding label when present.
+const PROVISIONING_LABEL: Record<string, string> = {
+  pending: 'Provisioning queued…',
+  processing: 'Provisioning in progress…',
+  processed: 'Provisioned ✓',
+  failed: 'Provisioning failed (see alerts)',
 };
 
 export default function ProvisioningPage() {
@@ -135,6 +145,13 @@ export default function ProvisioningPage() {
               {members.map((m) => {
                 const hasFunding = m.fundingStatus != null;
                 const canStart = !hasFunding && !busy[m.customerId];
+                // Provisioning status (downstream) takes precedence over the
+                // funding label once the cron has picked up the arrival.
+                const statusText = m.provisioningStatus
+                  ? (PROVISIONING_LABEL[m.provisioningStatus] ?? m.provisioningStatus)
+                  : m.fundingStatus
+                    ? (FUNDING_LABEL[m.fundingStatus] ?? m.fundingStatus)
+                    : null;
                 return (
                   <tr key={m.customerId} className="hover:bg-gray-50 align-top">
                     <td className="py-3 px-4 border-b">
@@ -175,9 +192,9 @@ export default function ProvisioningPage() {
                       </div>
                     </td>
                     <td className="py-3 px-4 border-b">
-                      {hasFunding ? (
+                      {statusText ? (
                         <span className="text-sm text-gray-600">
-                          {FUNDING_LABEL[m.fundingStatus!] ?? m.fundingStatus}
+                          {statusText}
                         </span>
                       ) : (
                         <button

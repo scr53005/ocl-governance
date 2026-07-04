@@ -2,7 +2,7 @@ import { NextResponse } from 'next/server';
 import { redis } from '@/lib/redis';
 import { isRenewal, normalizeDuration } from '@/lib/membership-math';
 import { computeFundableEur } from '@/lib/funding-math';
-import type { CustomerRecord, FundingTxRecord, MembershipDuration } from '@/lib/types';
+import type { CustomerRecord, FundingTxRecord, MembershipDuration, TxStatus } from '@/lib/types';
 
 // GET /api/ops/pending-members
 // Lists membership customers who still need provisioning: customer:* records
@@ -24,6 +24,11 @@ export type PendingMember = {
   rawMembershipType: string;          // the label as stored (e.g. "12months")
   isRenewal: boolean;
   fundingStatus: FundingTxRecord['status'] | null;
+  // Status of the downstream membership-provision run, once the funded HIVE
+  // has landed and the cron created its tx record. Joined via the funding
+  // record's withdraw_tx_id (= the on-chain arrival tx id = the cron's key).
+  // null until the cron has picked up the arrival.
+  provisioningStatus: TxStatus | null;
   defaultEur: number | null;
   createdAt: string;
 };
@@ -60,6 +65,19 @@ export async function GET() {
         ? (typeof fundingRaw === 'string' ? JSON.parse(fundingRaw) : fundingRaw)
         : null;
 
+      // If the funded HIVE has landed, the cron created membership:tx:<txid>
+      // keyed by the on-chain arrival — which is exactly funding.withdraw_tx_id.
+      // Surface that record's status so the UI can show provisioning progress
+      // instead of a stale "awaiting cron".
+      let provisioningStatus: TxStatus | null = null;
+      if (funding?.withdraw_tx_id) {
+        const mtxRaw = await redis.get<{ status?: TxStatus }>(`membership:tx:${funding.withdraw_tx_id}`);
+        if (mtxRaw) {
+          const mtx = typeof mtxRaw === 'string' ? JSON.parse(mtxRaw) : mtxRaw;
+          provisioningStatus = (mtx.status as TxStatus | undefined) ?? null;
+        }
+      }
+
       members.push({
         customerId: rec.customerId,
         firstName: rec.firstName,
@@ -70,6 +88,7 @@ export async function GET() {
         rawMembershipType: rec.membershipType,
         isRenewal: isRenewal(rec.hiveAccountCreated),
         fundingStatus: funding?.status ?? null,
+        provisioningStatus,
         defaultEur: computeFundableEur(rec.membershipType),
         createdAt: rec.createdAt,
       });

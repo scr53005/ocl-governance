@@ -54,7 +54,7 @@ npx tsx scripts/trigger-funding.ts cus_XXXX --send     # dispatch (spends REAL E
 npx tsx scripts/trigger-funding.ts cus_XXXX --eur 117.43 --send   # override the amount
 ```
 
-**Or from the UI** — the **Member Provisioning** page (`/provisioning`, linked from the home page) lists membership customers who have paid but aren't yet provisioned (`customer:*` with `provisionedAt == null` and a membership duration — education records, which never carry a duration, are excluded). Each row shows new-vs-renewal, a €-to-spend input (prefilled with the computed fundable amount), and its live funding status (joined from `funding:tx:*`, so a row that's already funding shows status instead of a button and can't be double-clicked). "Start provisioning" POSTs to `/api/ops/fund-membership`, which sanitizes the € (1–1000, 2 dp), refuses if already provisioned or funding is in flight, and sends `membership/funding-requested`. `GET /api/ops/pending-members` backs the list.
+**Or from the UI** — the **Member Provisioning** page (`/provisioning`, linked from the home page) lists membership customers who have paid but aren't yet provisioned (`customer:*` with `provisionedAt == null` and a membership duration — education records, which never carry a duration, are excluded). Each row shows new-vs-renewal, a €-to-spend input (prefilled with the computed fundable amount), and a live status. That status is joined from two places: the **funding** leg (`funding:tx:*`) and, once the HIVE has landed, the downstream **provisioning** run (`membership:tx:*`, looked up via the funding record's `withdraw_tx_id` — which equals the on-chain arrival tx id the cron keys on). Provisioning status takes precedence, so the row progresses `Funding → HIVE delivered — awaiting cron → Provisioning in progress → Provisioned ✓`, then drops off the list once `provisionedAt` is set. A row that's already funding shows status instead of a button and can't be double-clicked. "Start provisioning" POSTs to `/api/ops/fund-membership`, which sanitizes the € (1–1000, 2 dp), refuses if already provisioned or funding is in flight, and sends `membership/funding-requested`. `GET /api/ops/pending-members` backs the list. (The list refreshes on the **Refresh** button.)
 
 > ⚠️ **No auth yet.** The provisioning page and its API routes are currently **open** (marked `TODO(auth)`). Operator authentication is being handled as part of the offchain.lu ↔ ocl-governance merge; gate these before that merge ships, since `POST /api/ops/fund-membership` spends real money.
 
@@ -89,8 +89,9 @@ Used whenever a workflow needs to convert HIVE into HBD:
 2. Walk the asks, accumulating `(hive, hbd)` while each ask's rate stays within **0.5%** of the best ask. Stop as soon as the chunk fills or the spread exceeds the threshold.
 3. Compute chunk VWAP and place a limit order with `min_to_receive = VWAP × 0.995` (0.5% slippage buffer).
 4. Poll `get_open_orders` every **5 minutes** (up to **6 polls = 30 minutes**). The order is considered filled when it no longer appears in the open-orders list.
-5. On fill, advance to the next chunk. Hard cap of **20 chunks** per workflow execution.
-6. If a chunk can't be filled within its poll window, or the order book becomes too thin for a valid chunk, or the chunk cap is hit → email `info@offchain.lu` and leave the unsold HIVE liquid on `ocl-paymaster` for manual resolution.
+5. On fill, advance to the next chunk (re-quote discount reset). Hard cap of **20 chunks** per workflow execution.
+6. **If the chunk is still fully unfilled after the 30-min poll window, re-quote it:** cancel the order, confirm the cancel settled, and re-place at a **larger discount** (+0.5% per re-quote, up to **3 re-quotes** / a **2%** rate floor). Each re-quote makes the sell more marketable. The re-quote is gated on the order being *fully* unfilled — a **partial** fill (read from the order's `for_sale`) is never re-sold; it's cancelled, the partial credited, and the swap stops with an admin email. A fill that lands in the cancel window is detected (cancel fails + order gone) and credited, never double-sold.
+7. If the order book is too thin for a valid chunk, the re-quote budget is exhausted, or the chunk cap is hit → email `info@offchain.lu` and leave the unsold HIVE liquid on `ocl-paymaster` for manual resolution. The pure re-quote decision logic (fill classification, discount cap) lives in `src/lib/chunk-reprice.ts` and is unit-tested.
 
 The 0.5% per-chunk spread is applied **per chunk, not globally** — across multiple chunks the effective walked rate can drift from the original best ask. To monitor this, `chunkedHbdSwap` captures a `HbdSwapMetrics` object onto the TxRecord's `hbd_swap_metrics` field in Redis: `initial_best_rate` and `final_best_rate` (HBD/HIVE at the first and last placed chunk), `effective_rate` (the VWAP actually walked across all filled chunks), `drift_pct` (positive = worse than the starting reference, negative = book moved in our favour during execution), plus `total_hive_sold`, `total_hbd_vwap`, `chunks_filled`, and `incomplete`. For `ocl-paymaster`'s accumulation use case we expect drift close to 0 most of the time; large positive drift is worth investigating on the TxRecord.
 
@@ -261,7 +262,9 @@ src/
     executor.ts                          VPS Binance executor HTTP client (funding leg)
     inngest.ts                           Inngest client singleton
     types.ts                             Shared types + TxRecord/FundingTxRecord factories
-    workflow-helpers.ts                  Chunked HBD/OCLT swaps, savings routing, alerts, Redis helpers
+    workflow-helpers.ts                  Chunked HBD/OCLT swaps (with re-quote), savings routing, alerts, Redis helpers
+    chunk-reprice.ts                     Pure re-quote decision logic for chunkedHbdSwap — unit-tested
+    chunk-reprice.test.ts                Vitest unit tests for chunk-reprice
     inngest-functions.ts                 Membership + education provisioning workflows (new + renewal)
     funding-functions.ts                 fund-membership workflow (EUR → HIVE via Binance → ocl-paymaster)
     funding-math.ts                      Pure funding helpers (fundable EUR, floor, buy-plan gating) — unit-tested

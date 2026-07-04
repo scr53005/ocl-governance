@@ -10,6 +10,7 @@ import {
   getOrderBook,
   getOpenOrders,
   broadcastLimitOrder,
+  broadcastLimitOrderCancel,
   broadcastHiveTransfer,
   broadcastToSavings,
   broadcastCustomJson,
@@ -28,6 +29,7 @@ import {
 } from './hive-engine';
 import type { GetStepTools } from 'inngest';
 import { inngest } from './inngest';
+import { parseForSaleHive, classifyFill, canReprice, nextDiscount } from './chunk-reprice';
 import type {
   Config,
   HbdSwapMetrics,
@@ -169,8 +171,13 @@ function escapeHtml(s: string): string {
 //      broadcast limit_order_create.
 //   4. Poll getOpenOrders every pollIntervalMinutes. When our orderid is
 //      no longer present, the chunk has filled.
-//   5. On fill: next chunk with fresh book read. On poll timeout: alert
-//      admin, leave the unfilled order to expire at its 1h limit, stop.
+//   5. On fill: next chunk with fresh book read, re-quote discount reset.
+//      On poll timeout of a FULLY-unfilled order: cancel it, confirm the
+//      cancel settled, and re-quote at a larger discount (up to
+//      maxRepricesPerChunk times / maxTotalDiscount). A partially-filled or
+//      undeterminable order is NOT re-quoted (never re-sell traded HIVE) —
+//      it's cancelled, the partial is credited, and the swap stops with an
+//      admin alert. Same stop on exhausting the re-quote budget.
 
 export type ChunkedHbdSwapParams = {
   step: WorkflowStep;
@@ -189,8 +196,16 @@ export type ChunkedHbdSwapParams = {
   maxChunks?: number;
   /** Minutes between fill-check polls (default 5). */
   pollIntervalMinutes?: number;
-  /** Max polls per chunk before giving up (default 6 = 30 min). */
+  /** Max polls per chunk before a re-quote / give-up (default 6 = 30 min). */
   maxPollsPerChunk?: number;
+  /** Extra discount added to `min_to_receive` on each re-quote of a
+   *  fully-unfilled chunk (default 0.005 = +0.5% per re-quote). */
+  repriceStepDiscount?: number;
+  /** Max re-quotes for a single stuck chunk before giving up (default 3). */
+  maxRepricesPerChunk?: number;
+  /** Floor on total discount — never re-quote below this rate (default
+   *  0.02 = 2%). Protects against dumping HIVE far under market. */
+  maxTotalDiscount?: number;
 };
 
 export type ChunkedHbdSwapResult = {
@@ -232,6 +247,9 @@ export async function chunkedHbdSwap(
     maxChunks = 20,
     pollIntervalMinutes = 5,
     maxPollsPerChunk = 6,
+    repriceStepDiscount = 0.005,
+    maxRepricesPerChunk = 3,
+    maxTotalDiscount = 0.02,
   } = params;
 
   const orderTxIds: string[] = [];
@@ -239,6 +257,11 @@ export async function chunkedHbdSwap(
   let totalHbdExpected = 0;
   let chunkIndex = 0;
   let incomplete = false;
+  // Re-quote state: on a fully-unfilled chunk we cancel and re-place at a
+  // larger discount. Both reset after any successful fill (the book cooperated,
+  // so the next fresh chunk starts at the base rate again).
+  let currentDiscount = slippageDiscount;
+  let repriceCount = 0;
 
   // Drift tracking — captured per chunk, rolled up at the end.
   let initialBestRate: number | null = null;
@@ -260,6 +283,7 @@ export async function chunkedHbdSwap(
   while (remaining > 0.001 && chunkIndex < maxChunks) {
     const captureIndex = chunkIndex;
     const captureRemaining = remaining;
+    const attemptDiscount = currentDiscount;
 
     // Place the chunk: read order book, walk asks, broadcast limit order.
     const placeResult: PlaceChunkResult = await step.run(
@@ -301,7 +325,7 @@ export async function chunkedHbdSwap(
 
         const sellAmount = parseFloat(chunkHive.toFixed(3));
         const vwap = chunkHbd / chunkHive;
-        const minHbd = parseFloat((sellAmount * vwap * (1 - slippageDiscount)).toFixed(3));
+        const minHbd = parseFloat((sellAmount * vwap * (1 - attemptDiscount)).toFixed(3));
 
         const orderId = makeRequestId(PAYMASTER, `${label}-${txId}-${captureIndex}`);
         const expiration = new Date(Date.now() + 60 * 60 * 1000).toISOString().slice(0, -5);
@@ -353,6 +377,22 @@ export async function chunkedHbdSwap(
     });
     orderTxIds.push(placeResult.broadcastTxId);
 
+    // Credit a fully-filled chunk: reduce remaining, accrue expected HBD, reset
+    // the re-quote escalation (the book cooperated), and roll the chunk into the
+    // drift metrics. Called from every path where the order left the book fully
+    // filled (poll success, filled-during-cancel, gone-at-orderstate). Pure
+    // mutation of loop state — no I/O — so it's replay-safe.
+    const creditFilledChunk = () => {
+      remaining = parseFloat((remaining - placeResult.sellAmount).toFixed(3));
+      totalHbdExpected += placeResult.minHbd;
+      currentDiscount = slippageDiscount;
+      repriceCount = 0;
+      if (initialBestRate === null) initialBestRate = placeResult.bestRate;
+      lastBestRate = placeResult.bestRate;
+      accumulatedHiveFilled += placeResult.sellAmount;
+      accumulatedHbdVwap += placeResult.chunkHbdVwap;
+    };
+
     // Poll for fill.
     let filled = false;
     for (let pollIndex = 0; pollIndex < maxPollsPerChunk; pollIndex++) {
@@ -375,27 +415,111 @@ export async function chunkedHbdSwap(
     }
 
     if (!filled) {
+      // Still resting after the poll window. Read its remaining size to tell a
+      // FULLY-unfilled order (safe to cancel + re-quote at a more modest rate)
+      // from a PARTIALLY-filled one — we must never re-sell HIVE that already
+      // traded, so a partial fill falls through to the safe stop below.
+      const orderState = await step.run(
+        `${label}-orderstate-${captureIndex}`,
+        async () => {
+          const orders = await getOpenOrders(PAYMASTER);
+          const mine = (orders as Array<{ orderid: number; for_sale?: unknown; sell_price?: { base?: string } }>)
+            .find((o) => o.orderid === placeResult.orderId);
+          if (!mine) return { present: false, remainingHive: null as number | null };
+          return { present: true, remainingHive: parseForSaleHive(mine.for_sale, mine.sell_price?.base) };
+        },
+      );
+
+      if (!orderState.present) {
+        // Gone from the book between the last poll and this read → it filled
+        // (same "gone = filled" heuristic the poll loop uses). Credit + advance.
+        creditFilledChunk();
+        chunkIndex++;
+        continue;
+      }
+
+      const { filledSoFar, fullyUnfilled } = classifyFill(placeResult.sellAmount, orderState.remainingHive);
+      const reprice = canReprice({
+        fullyUnfilled, repriceCount, currentDiscount,
+        maxRepricesPerChunk, repriceStepDiscount, maxTotalDiscount,
+      });
+
+      if (reprice) {
+        // Cancel the stale order, let it settle, and CONFIRM it's gone before
+        // re-placing — otherwise a fill landing in the cancel window plus a
+        // fresh order would double-sell the chunk. The cancel is soft: if the
+        // order filled in that window the cancel throws ("no such order"), and
+        // `cancelOk === false` + gone tells us it FILLED (not cancelled).
+        const cancelOk = await step.run(`${label}-cancel-${captureIndex}`, async () => {
+          try {
+            await broadcastLimitOrderCancel({ owner: PAYMASTER, order_id: placeResult.orderId });
+            return true;
+          } catch (e) {
+            console.warn(`[WORKFLOW] ${label} cancel ${placeResult.orderId} failed (likely already gone): ${(e as Error).message}`);
+            return false;
+          }
+        });
+        await step.sleep(`${label}-cancel-settle-${captureIndex}`, '15s');
+        const stillResting = await step.run(`${label}-cancel-confirm-${captureIndex}`, async () => {
+          const orders = await getOpenOrders(PAYMASTER);
+          return (orders as Array<{ orderid: number }>).some((o) => o.orderid === placeResult.orderId);
+        });
+
+        if (stillResting) {
+          // Cancel didn't settle — stop rather than risk a double-sell.
+          await step.run(`${label}-cancel-stuck-alert-${captureIndex}`, async () => {
+            await sendAlert(
+              `${namespace}: HBD chunk cancel did not settle`,
+              `Chunk ${captureIndex} (orderid ${placeResult.orderId}) still open 15s after cancel. ` +
+              `Tx: ${txId}. Stopped to avoid a double-sell; admin intervention required.`,
+            );
+          });
+          incomplete = true;
+          break;
+        }
+
+        if (!cancelOk) {
+          // Cancel failed AND the order is gone → it FILLED in the cancel
+          // window. Credit it as a completed fill and advance; do NOT re-quote.
+          creditFilledChunk();
+          console.log(`[WORKFLOW] ${label} chunk ${captureIndex} filled during cancel window — credited, not re-quoted`);
+          chunkIndex++;
+          continue;
+        }
+
+        // Genuine cancel of a fully-unfilled order → escalate + re-quote.
+        currentDiscount = nextDiscount(currentDiscount, repriceStepDiscount);
+        repriceCount++;
+        console.log(
+          `[WORKFLOW] ${label} chunk ${captureIndex} unfilled — re-quoting at ` +
+          `${(currentDiscount * 100).toFixed(2)}% discount (reprice ${repriceCount}/${maxRepricesPerChunk})`,
+        );
+        chunkIndex++; // consume a slot; next iteration re-places at the larger discount
+        continue;
+      }
+
+      // Give up: cancel to free the HIVE, credit any partial fill so it isn't
+      // re-sold, alert, and stop.
       await step.run(`${label}-unfilled-alert-${captureIndex}`, async () => {
+        await broadcastLimitOrderCancel({ owner: PAYMASTER, order_id: placeResult.orderId }).catch(() => {});
         await sendAlert(
           `${namespace}: HBD chunk not filled`,
           `Chunk ${captureIndex} (${placeResult.sellAmount} HIVE, orderid ${placeResult.orderId}) ` +
-          `not filled after ${maxPollsPerChunk * pollIntervalMinutes} minutes. Tx: ${txId}. ` +
-          `Order will expire at its 1h limit; admin intervention required.`,
+          `not filled after re-quoting to ${(currentDiscount * 100).toFixed(2)}% ` +
+          `(${repriceCount} re-quote${repriceCount === 1 ? '' : 's'}). Tx: ${txId}. ` +
+          (filledSoFar > 0 ? `Partial fill ~${filledSoFar} HIVE credited. ` : '') +
+          `Remaining HIVE left liquid on ${PAYMASTER}; admin intervention required.`,
         );
       });
+      if (filledSoFar > 0) {
+        remaining = parseFloat((remaining - filledSoFar).toFixed(3));
+      }
       incomplete = true;
       break;
     }
 
-    remaining = parseFloat((remaining - placeResult.sellAmount).toFixed(3));
-    totalHbdExpected += placeResult.minHbd;
-
-    // Drift accumulation — only for chunks that were confirmed filled.
-    if (initialBestRate === null) initialBestRate = placeResult.bestRate;
-    lastBestRate = placeResult.bestRate;
-    accumulatedHiveFilled += placeResult.sellAmount;
-    accumulatedHbdVwap += placeResult.chunkHbdVwap;
-
+    // Full fill via the poll loop — credit and advance.
+    creditFilledChunk();
     chunkIndex++;
   }
 
