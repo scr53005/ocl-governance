@@ -41,7 +41,7 @@ import {
   type FundingTxRecord,
   type FundingBuyChunk,
 } from './types';
-import { floorHive, decideBuyPlan, type BuyPlan } from './funding-math';
+import { floorHive, computeNetHive, decideBuyPlan, type BuyPlan } from './funding-math';
 import { normalizeDuration } from './membership-math';
 
 // Binance HIVE network withdrawal fee, in HIVE. Overridable via env to match
@@ -193,6 +193,7 @@ export const fundMembership = inngest.createFunction(
     // ── Step 3: USDC → HIVE (chunked LIMIT IOC buys) ────────────────────
     let remainingUsdc = record.usdc_obtained;
     let hiveObtained = 0;
+    let tradingFeeHive = 0;
     let usdcSpent = 0;
     let weightedSlippage = 0;
     let consecutiveWaits = 0;
@@ -220,6 +221,7 @@ export const fundMembership = inngest.createFunction(
       }
 
       hiveObtained += fill.hive;
+      tradingFeeHive += fill.feeHive;
       usdcSpent += fill.usdc;
       remainingUsdc = Math.max(0, remainingUsdc - fill.usdc);
       weightedSlippage += plan.slippageBps * fill.usdc;
@@ -233,6 +235,7 @@ export const fundMembership = inngest.createFunction(
       };
       record.buy_chunks = [...record.buy_chunks, chunk];
       record.hive_obtained = hiveObtained;
+      record.trading_fee_hive = tradingFeeHive;
       await step.run(`persist-buy-${chunkIndex}`, async () => { await saveFunding(stripe_customer_id, record); });
     }
 
@@ -245,30 +248,52 @@ export const fundMembership = inngest.createFunction(
     const cumulativeSlippageBps = usdcSpent > 0 ? weightedSlippage / usdcSpent : 0;
     console.log(`[FUNDING] ${stripe_customer_id}: bought ${hiveObtained} HIVE for ${usdcSpent} USDC (blended ${cumulativeSlippageBps.toFixed(1)} bps)`);
 
-    // ── Step 4: net HIVE after Binance withdrawal fee ───────────────────
-    const netHive = floorHive(hiveObtained - HIVE_WITHDRAWAL_FEE);
+    // ── Step 4: net HIVE after fees ─────────────────────────────────────
+    // hiveObtained is the GROSS filled quantity (Σ executedQty). Binance also
+    // charges a spot trading commission IN HIVE (~0.1%) on a buy, deducted from
+    // what actually credits to Spot — so the free balance is
+    // `hiveObtained − tradingFeeHive`, not hiveObtained. Subtract BOTH the
+    // trading commission and the 0.1 HIVE network withdrawal fee, or the
+    // settle-wait below targets a balance that never arrives (the 2026-07 bug
+    // that stranded stefr's HIVE at needs_review).
+    const expectedNet = computeNetHive(hiveObtained, tradingFeeHive, HIVE_WITHDRAWAL_FEE);
     record.hive_withdrawal_fee = HIVE_WITHDRAWAL_FEE;
-    record.net_hive = netHive;
+    record.trading_fee_hive = tradingFeeHive;
+    record.net_hive = expectedNet;
     await step.run('persist-net-hive', async () => { await saveFunding(stripe_customer_id, record); });
-    if (netHive < 0.001) {
-      return failReview(step, stripe_customer_id, record, `Net HIVE after fee too small: ${netHive}`);
+    if (expectedNet < 0.001) {
+      return failReview(step, stripe_customer_id, record, `Net HIVE after fees too small: ${expectedNet}`);
     }
 
     // ── Step 5: wait for bought HIVE to settle into Binance Spot ─────────
     let hiveReady = false;
+    let freeHiveAtSettle = 0;
     for (let poll = 1; poll <= HIVE_BALANCE_MAX_POLLS; poll++) {
       const freeHive = await step.run(`hive-balance-${poll}`, async () => (
         extractFreeBalance(await getExecutorBinanceAccount(BINANCE_PROFILE), 'HIVE')
       ));
-      if (freeHive >= netHive) { hiveReady = true; break; }
+      if (freeHive >= expectedNet) { hiveReady = true; freeHiveAtSettle = freeHive; break; }
       if (poll < HIVE_BALANCE_MAX_POLLS) {
         await step.sleep(`hive-balance-wait-${poll}`, `${HIVE_BALANCE_POLL_SECONDS}s`);
       }
     }
     if (!hiveReady) {
       return failReview(step, stripe_customer_id, record,
-        `Timed out waiting for Binance free HIVE ≥ ${netHive}`);
+        `Timed out waiting for Binance free HIVE ≥ ${expectedNet}`);
     }
+
+    // Withdraw the FULL live free balance (floored to 3 dp). Binance deducts
+    // the network fee FROM this amount, so what lands on chain is
+    // `withdrawAmount − fee` — we must NOT pre-subtract the fee (that would
+    // strand 0.1 HIVE on Binance and under-deliver by a fee). expectedNet above
+    // only gates the settle-wait; the actual send is the whole balance.
+    const withdrawAmount = floorHive(freeHiveAtSettle);
+    if (withdrawAmount <= HIVE_WITHDRAWAL_FEE) {
+      return failReview(step, stripe_customer_id, record, `Free HIVE too small to withdraw: ${withdrawAmount}`);
+    }
+    // record.net_hive = what actually reaches ocl-paymaster on chain (audit).
+    record.net_hive = floorHive(withdrawAmount - HIVE_WITHDRAWAL_FEE);
+    await step.run('persist-withdraw-amount', async () => { await saveFunding(stripe_customer_id, record); });
 
     // ── Step 6: withdraw HIVE → ocl-paymaster with the membership memo ───
     // Idempotent: the deterministic withdrawOrderId means a replay/retry can
@@ -282,7 +307,7 @@ export const fundMembership = inngest.createFunction(
         network: 'HIVE',
         address: PAYMASTER,
         addressTag: memo,
-        amount: netHive.toFixed(3),
+        amount: withdrawAmount.toFixed(3),
         withdrawOrderId,
         profile: BINANCE_PROFILE,
       });
@@ -332,7 +357,7 @@ export const fundMembership = inngest.createFunction(
             );
           });
           console.log(`[FUNDING] ${stripe_customer_id}: withdrawal completed, tx=${match.txId}`);
-          return { status: 'processed', customer: stripe_customer_id, net_hive: netHive, tx_id: match.txId };
+          return { status: 'processed', customer: stripe_customer_id, net_hive: record.net_hive, tx_id: match.txId };
         }
         if (isFailedWithdrawal(match.status)) {
           record.status = 'failed';
@@ -406,7 +431,7 @@ async function planHiveBuy(chunkUsdc: number, maxSlippageBps: number): Promise<B
   return decideBuyPlan(recordOrNull(getExecutorBinancePayload(resp)));
 }
 
-async function placeHiveBuy(plan: BuyPlan): Promise<{ hive: number; usdc: number; orderId: string | null; status: string }> {
+async function placeHiveBuy(plan: BuyPlan): Promise<{ hive: number; usdc: number; feeHive: number; orderId: string | null; status: string }> {
   const resp = await placeExecutorBinanceOrder({
     symbol: 'HIVEUSDC', side: 'BUY', type: 'LIMIT',
     quantity: plan.quantity, price: plan.limitPrice,
@@ -417,9 +442,29 @@ async function placeHiveBuy(plan: BuyPlan): Promise<{ hive: number; usdc: number
   return {
     hive: numberFromUnknown(order.executedQty),
     usdc: numberFromUnknown(order.cummulativeQuoteQty),
+    feeHive: extractHiveCommission(order),
     orderId: stringOrNull(order.orderId) ?? (order.orderId != null ? String(order.orderId) : null),
     status: stringOrNull(order.status) ?? 'UNKNOWN',
   };
+}
+
+/**
+ * Sum the Binance spot commission charged in HIVE across an order's fills. On a
+ * HIVEUSDC BUY the fee is normally taken in the received asset (HIVE), so the
+ * credited balance is executedQty − thisCommission. Returns 0 if the account
+ * pays fees in BNB (commissionAsset !== 'HIVE'), in which case executedQty
+ * credits in full — so this is correct in both fee modes.
+ */
+function extractHiveCommission(order: Record<string, unknown>): number {
+  const fills = Array.isArray(order.fills) ? order.fills : [];
+  let total = 0;
+  for (const f of fills) {
+    const fill = recordOrNull(f);
+    if (fill && fill.commissionAsset === 'HIVE') {
+      total += numberFromUnknown(fill.commission);
+    }
+  }
+  return total;
 }
 
 // Binance withdrawal status codes: 6 = completed; 1/3/5 = failed/cancelled/rejected.

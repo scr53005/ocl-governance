@@ -153,7 +153,8 @@ export type FundingTxRecord = {
   eur_spent: number;
   usdc_obtained: number;
   buy_chunks: FundingBuyChunk[];
-  hive_obtained: number;        // gross HIVE bought on Binance
+  hive_obtained: number;        // gross HIVE bought (sum of order executedQty)
+  trading_fee_hive: number;     // Binance spot commission charged in HIVE on the buys
   hive_withdrawal_fee: number;  // Binance network fee (default 0.1 HIVE)
   net_hive: number;             // amount actually withdrawn to ocl-paymaster
   // Withdrawal identifiers
@@ -187,6 +188,7 @@ export function newFundingTxRecord(init: NewFundingTxRecordInit): FundingTxRecor
     usdc_obtained: 0,
     buy_chunks: [],
     hive_obtained: 0,
+    trading_fee_hive: 0,
     hive_withdrawal_fee: 0,
     net_hive: 0,
     withdraw_order_id: init.withdraw_order_id,

@@ -38,7 +38,7 @@ Flow (triggered by the `membership/funding-requested` event):
 1. **Check EUR balance** on Binance (via the executor's `outbound` profile). Abort → `needs_review` if below the requested amount.
 2. **EUR → USDC** — single `EURUSDC` LIMIT IOC sell for the fundable amount.
 3. **USDC → HIVE** — chunked `HIVEUSDC` LIMIT IOC buys under a per-chunk slippage cap (default 50 bps, 20-chunk circuit breaker).
-4. **Withdraw HIVE → `ocl-paymaster`** with `addressTag = <membership memo>` and a **deterministic `withdrawOrderId` (`ocl-fund-<customerId>`)** so a replay/retry can never double-withdraw. Poll Binance withdraw-history to completion.
+4. **Withdraw HIVE → `ocl-paymaster`** with `addressTag = <membership memo>` and a **deterministic `withdrawOrderId` (`ocl-fund-<customerId>`)** so a replay/retry can never double-withdraw. The withdrawal sends the **full live free HIVE balance** (`grossBought − tradingCommission`, floored to 3 dp — Binance charges the spot commission **in HIVE** on the buy unless fees are paid in BNB, so the free balance is below the gross `executedQty`). Binance deducts the network fee *from* that amount, so `≈ balance − 0.1` reaches the chain — the fee is **not** pre-subtracted (doing so would strand 0.1 HIVE on Binance and under-deliver). The settle-wait target uses `computeNetHive(...)`. Poll Binance withdraw-history to completion.
 5. Email `info@offchain.lu` a funding summary. The 5-min cron then detects the arrival and fires provisioning.
 
 The **fundable EUR amount** is `gross membership price − Stripe fee − Binance fiat-deposit fee`, per plan: 6-month `60 − 1.57 − 1 = 57.43 €`, annual `100 − 4.85 − 1 = 94.15 €`. The Binance deposit fee is flat but the **Stripe fee varies per transaction** (card type/country), so `MEMBERSHIP_PRICING` in `funding-math.ts` stores the fee Stripe actually charged per plan — these are a **prefill only**; the operator enters/overrides the real € (the amount they moved to Binance) in the UI or via `--eur`. The amount is passed on the event, not hardcoded in the workflow.
@@ -275,6 +275,7 @@ scripts/
   backfill-customers.ts                  Backfill customer records into Redis
   inspect-customer.ts                    Read-only dump of one customer record from Redis
   trigger-funding.ts                     Dispatch the fund-membership workflow (dry-run by default)
+  recover-funding-withdrawal.ts          Withdraw already-bought HIVE for a stuck funding run (dry-run by default)
   list-our-accounts.ts                   Audit Hive accounts owned by offchain-lux
 config.json                              Base configuration (seeded to Redis)
 vercel.json                              Cron schedule configuration

@@ -48,6 +48,21 @@ export function floorHive(n: number): number {
   return Math.floor(n * 1000) / 1000;
 }
 
+/**
+ * Withdrawable net HIVE after Binance fees, floored to 3 dp.
+ *
+ * `hiveObtained` is the GROSS filled quantity (Σ order executedQty). Binance
+ * ALSO charges a spot trading commission in HIVE on a buy (unless fees are paid
+ * in BNB), deducted from what credits to Spot — so the free balance is
+ * `hiveObtained − tradingFeeHive`. Both that commission AND the network
+ * withdrawal fee must come off, or a settle-wait targets a balance that never
+ * arrives. (Regression for the 2026-07 bug that stranded stefr's HIVE:
+ * gross 1249.0 − 0.1 withdrawal alone = 1248.9, but only 1247.81 ever credited.)
+ */
+export function computeNetHive(hiveObtained: number, tradingFeeHive: number, withdrawalFee: number): number {
+  return floorHive(hiveObtained - tradingFeeHive - withdrawalFee);
+}
+
 export type BuyPlan = {
   proceed: boolean;
   done: boolean; // remaining USDC below Binance min — stop the chunker cleanly

@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   computeFundableEur,
   floorHive,
+  computeNetHive,
   decideBuyPlan,
 } from './funding-math';
 
@@ -45,6 +46,26 @@ describe('floorHive', () => {
   it('handles a gross-minus-fee net like the workflow computes it', () => {
     // hive bought 57.9021, minus 0.1 withdrawal fee → floor(57.8021) to 3dp
     expect(floorHive(57.9021 - 0.1)).toBe(57.802);
+  });
+});
+
+describe('computeNetHive (regression: the 2026-07 trading-fee bug)', () => {
+  it('subtracts BOTH the trading commission and the withdrawal fee', () => {
+    // stefr's stranded run: gross executedQty ≈ 1249.0, HIVE commission ≈ 1.19,
+    // network withdrawal fee 0.1 → only ~1247.81 actually credits to Spot.
+    // The buggy code omitted the commission and targeted 1248.9 (unreachable).
+    const net = computeNetHive(1249.0, 1.19, 0.1);
+    expect(net).toBeCloseTo(1247.71, 2);
+    // Must never exceed the credited free balance (gross − commission).
+    expect(net).toBeLessThan(1249.0 - 1.19);
+  });
+
+  it('equals gross − withdrawal fee when the trading fee is 0 (fees paid in BNB)', () => {
+    expect(computeNetHive(240, 0, 0.1)).toBe(239.9);
+  });
+
+  it('floors to 3 decimals', () => {
+    expect(computeNetHive(100.98765, 0.5, 0.1)).toBe(100.387);
   });
 });
 
