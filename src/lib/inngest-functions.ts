@@ -23,7 +23,7 @@ import {
   wrapAndChunkedOcltSwap,
   hbdToSavings,
 } from './workflow-helpers';
-import { resolveMembershipGrants, isRenewal } from './membership-math';
+import { resolveMembershipGrants, isRenewal, planAccountAction } from './membership-math';
 
 // ── Main Inngest Function ──────────────────────────────────────────────
 
@@ -74,11 +74,12 @@ export const membershipProvision = inngest.createFunction(
       console.log(`[MEMBERSHIP] ${account_name} is a RENEWAL — member grants (OCLT stake/transfer, HBD) will be skipped; HIVE conversion runs as usual.`);
     }
 
-    // ── Step 2: Verify/create Hive account ────────────────────────────
-    // IMPORTANT: If account exists, verify it's ours (recovery_account = offchain-lux).
-    // If it belongs to someone else, this is a collision — abort and alert admin.
+    // ── Step 2: Plan the member account (READ ONLY — never aborts) ────
+    // A member-side problem (name collision, missing account) must NEVER block
+    // the back-office HIVE conversion. So here we only READ and build a plan;
+    // Phase A (conversion) runs regardless, and Phase B acts on the plan after.
 
-    // Step 2a: Get creator account name (needed for both ownership check and creation)
+    // Creator account (for the ownership check and, later, account creation).
     const creator = await step.run('get-creator', async () => {
       const res = await callOffchainLu('/api/hive/creator-account');
       if (!res.ok) throw new Error(`get-creator failed: HTTP ${res.status}`);
@@ -86,113 +87,123 @@ export const membershipProvision = inngest.createFunction(
       return data.creator as string;
     });
 
-    // Step 2b: Check if account exists and verify ownership
-    const accountStatus = await step.run('check-account', async () => {
+    // Decide what Phase B will do with the account — WITHOUT acting or aborting.
+    //  skip            renewal, account present → no create/grants/ownership check
+    //  renewal_missing renewal but account absent → member can't be provisioned
+    //  create          new member, account absent → create it
+    //  use             new member, account present & ours → provision onto it
+    //  collision       new member, account present but NOT ours → member blocked
+    const accountPlan = await step.run('plan-account', async () => {
       const info = await getAccountInfo(account_name);
-
-      if (!info) {
-        // Account doesn't exist — needs creation
-        return 'needs_creation' as const;
-      }
-
-      // Account exists — verify it's ours with two checks:
-      // 1. recovery_account must be offchain-lux or the creator account
-      // 2. creation date must be 2026 or later (OCL started creating accounts in 2026)
-      const isOurRecovery = info.recovery_account === creator || info.recovery_account === 'offchain-lux';
-      const createdDate = new Date(info.created + 'Z');
-      const isRecentEnough = createdDate.getFullYear() >= 2026;
-
-      if (isOurRecovery && isRecentEnough) {
-        console.log(`[MEMBERSHIP] Account ${account_name} exists and is ours (recovery: ${info.recovery_account}, created: ${info.created})`);
-        return 'ours' as const;
-      }
-
-      // Account exists but is NOT ours — collision
-      const reason = !isOurRecovery
-        ? `recovery_account is ${info.recovery_account} (expected ${creator} or offchain-lux)`
-        : `created ${info.created} (before 2026, predates our account creation)`;
-
-      await updateTxRecord('membership', tx_id, {
-        status: 'failed',
-        error: `Account ${account_name} not ours: ${reason}`,
-      });
-      await sendAlert(
-        'Membership: Account name collision',
-        `Account "${account_name}" exists but is not ours: ${reason}. ` +
-        `Customer: ${stripe_customer_id}, Tx: ${tx_id}. Manual intervention required — ` +
-        `contact the customer to choose a different account name.`,
+      return planAccountAction(
+        info ? { recovery_account: info.recovery_account, created: info.created } : null,
+        renewal,
+        creator,
       );
-      return 'collision' as const;
     });
 
-    // Hard stop if collision — do not provision tokens to a stranger's account
-    if (accountStatus === 'collision') {
-      return {
-        tx_id,
-        account_name,
-        status: 'failed',
-        reason: 'account_name_collision',
-      };
+    const config = await step.run('read-config', async () => {
+      return getConfig();
+    }) as Config;
+
+    // Renewals deliver ZERO member grants; new members get the duration grant.
+    const { stakeOclt, liquidOclt, hbdTransfer } = resolveMembershipGrants(duration, config, renewal);
+
+    // Reserve the creation fee out of the payment ONLY if we'll create an
+    // account, so the conversion converts the rest and the fee stays liquid for
+    // Phase B. A read-only decision — it never blocks the conversion.
+    const willCreate = accountPlan.action === 'create';
+    const reserve = willCreate ? (config.accountCreationFee ?? 3) : 0;
+
+    // ══ PHASE A: back-office HIVE conversion (member-independent) ══════
+    // Always runs. Idempotent across a re-dispatch via `converted_at`, so a
+    // retry of a Phase-B failure never re-converts.
+    const alreadyConverted = await step.run('check-converted', async () => {
+      const rec = await redis.get<{ converted_at?: string | null }>(`membership:tx:${tx_id}`);
+      const r = rec ? (typeof rec === 'string' ? JSON.parse(rec) : rec) : null;
+      return Boolean(r?.converted_at);
+    });
+
+    if (!alreadyConverted) {
+      const netHive = parseFloat((hive_amount - reserve).toFixed(3));
+      const hbdPct = (config.hiveToHbdPct ?? 90) / 100;
+      const ocltPct = (config.hiveToOcltPct ?? 10) / 100;
+      const hiveForHbd = parseFloat((netHive * hbdPct).toFixed(3));
+      const hiveForOclt = parseFloat((netHive * ocltPct).toFixed(3));
+
+      // Sell HIVE → HBD, route to savings (keeping `hbdTransfer` HBD liquid on
+      // paymaster for a 1-year member's HBD grant in Phase B).
+      if (hiveForHbd > 0) {
+        await chunkedHbdSwap({ step, namespace: 'membership', txId: tx_id, label: 'hbd', hiveAmount: hiveForHbd });
+        await hbdToSavings({
+          step, namespace: 'membership', txId: tx_id, label: 'hbd-savings',
+          reserveHbd: hbdTransfer,
+          threshold: config.paymasterSavingsThreshold ?? 600,
+          treasuryAccount: config.treasuryAccount ?? 'ocl-trez',
+        });
+      }
+
+      // Wrap HIVE → SWAP.HIVE, chunk-swap to OCLT (accumulated on paymaster).
+      if (hiveForOclt > 0) {
+        await wrapAndChunkedOcltSwap({ step, namespace: 'membership', txId: tx_id, label: 'oclt', hiveAmount: hiveForOclt });
+      }
+
+      await step.run('mark-converted', async () => {
+        await updateTxRecord('membership', tx_id, { converted_at: new Date().toISOString() });
+        console.log(`[MEMBERSHIP] Back-office conversion complete for tx ${tx_id} (netHive ${netHive})`);
+      });
+    } else {
+      console.log(`[MEMBERSHIP] Conversion already done for tx ${tx_id} — skipping Phase A (re-dispatch).`);
     }
 
-    // A renewal implies the member's account already exists. If it somehow
-    // doesn't, that's an inconsistency (offchain.lu marked "skipped_renewal"
-    // for a missing account) — do NOT create it silently; stop and alert.
-    if (renewal && accountStatus === 'needs_creation') {
-      await step.run('renewal-missing-account', async () => {
+    // ══ PHASE B: member provisioning (may fail; conversion above stands) ═
+    // From here a failure records a member-side problem but never undoes or
+    // blocks the completed conversion.
+
+    // Collision / renewal-missing → the member can't be provisioned, but the
+    // funds are already converted. Record it and stop (re-dispatch after the
+    // operator fixes the account; the conversion won't re-run).
+    if (accountPlan.action === 'collision' || accountPlan.action === 'renewal_missing') {
+      await step.run('member-blocked', async () => {
+        const detail = accountPlan.action === 'collision'
+          ? `account "${account_name}" is not ours — ${accountPlan.reason}`
+          : `renewal marked but account "${account_name}" does not exist`;
         await updateTxRecord('membership', tx_id, {
           status: 'failed',
-          error: `Renewal for ${account_name} but account does not exist`,
+          error: `Back-office conversion completed; member NOT provisioned — ${detail}`,
         });
         await sendAlert(
-          'Membership: renewal for missing account',
-          `Customer ${stripe_customer_id} is marked as a renewal (skipped_renewal) but Hive account ` +
-          `"${account_name}" does not exist. Tx: ${tx_id}. Manual intervention required.`,
+          accountPlan.action === 'collision'
+            ? 'Membership: account collision (funds converted, member pending)'
+            : 'Membership: renewal for missing account (funds converted)',
+          `The HIVE conversion for tx ${tx_id} completed (treasury funded), but the member could NOT ` +
+          `be provisioned: ${detail}. Customer: ${stripe_customer_id}. Resolve the account, then ` +
+          `re-dispatch (the conversion won't re-run).`,
         );
       });
-      return { tx_id, account_name, status: 'failed', reason: 'renewal_account_missing' };
+      return { tx_id, account_name, status: 'failed', reason: accountPlan.action, converted: true };
     }
 
     let accountWasCreated = false;
-
-    if (accountStatus === 'needs_creation') {
-      // Step 2c: Fund creator with account creation fee
+    if (accountPlan.action === 'create') {
+      // Fund creator with the reserved creation fee, then create the account.
       await step.run('fund-creator', async () => {
-        const config = await getConfig();
         const fee = config.accountCreationFee ?? 3;
-
-        const result = await broadcastHiveTransfer({
-          from: PAYMASTER,
-          to: creator,
-          amount: hive(fee),
-          memo: 'account creation fee',
-        });
-
+        const result = await broadcastHiveTransfer({ from: PAYMASTER, to: creator, amount: hive(fee), memo: 'account creation fee' });
         await updateTxRecord('membership', tx_id, { fund_creator_tx_id: result.tx_id });
         console.log(`[MEMBERSHIP] Funded ${creator} with ${fee} HIVE (tx ${result.tx_id})`);
       });
-
-      // Step 2d: Request account creation
       await step.run('request-account-creation', async () => {
         const res = await callOffchainLu('/api/hive/create-account', {
           method: 'POST',
           body: JSON.stringify({ accountName: account_name }),
         });
-
         if (!res.ok) {
-          if (res.status === 503) {
-            throw new Error('Hive API unavailable, will retry');
-          }
+          if (res.status === 503) throw new Error('Hive API unavailable, will retry');
           throw new Error(`create-account failed: HTTP ${res.status}`);
         }
-
         const data = await res.json();
-
-        if (!data.success) {
-          throw new Error(`create-account failed: ${data.reason}`);
-        }
-
-        // Store credentials temporarily for email delivery in Step 6
+        if (!data.success) throw new Error(`create-account failed: ${data.reason}`);
         if (data.seed || data.masterPassword) {
           await redis.set(`membership:credentials:${account_name}`, JSON.stringify({
             seed: data.seed,
@@ -200,64 +211,10 @@ export const membershipProvision = inngest.createFunction(
             createdAt: new Date().toISOString(),
           }));
         }
-
         await updateTxRecord('membership', tx_id, { account_creation_tx_id: data.tx_id || 'created' });
         console.log(`[MEMBERSHIP] Account ${account_name} created`);
       });
-
       accountWasCreated = true;
-    }
-
-    // ── Step 3: Reserve management — convert received HIVE ──────────
-
-    const config = await step.run('read-config', async () => {
-      return getConfig();
-    }) as Config;
-
-    // Renewals deliver ZERO member grants (no OCLT stake/transfer, no HBD) —
-    // the HIVE conversion below still runs identically. New members get the
-    // full duration-based grant.
-    const { stakeOclt, liquidOclt, hbdTransfer } = resolveMembershipGrants(duration, config, renewal);
-
-    const creationFee = accountWasCreated ? (config.accountCreationFee ?? 3) : 0;
-    const netHive = hive_amount - creationFee;
-    const hbdPct = (config.hiveToHbdPct ?? 90) / 100;
-    const ocltPct = (config.hiveToOcltPct ?? 10) / 100;
-    const hiveForHbd = parseFloat((netHive * hbdPct).toFixed(3));
-    const hiveForOclt = parseFloat((netHive * ocltPct).toFixed(3));
-
-    // Step 3a: Sell HIVE → HBD via chunked order-book walk
-    if (hiveForHbd > 0) {
-      await chunkedHbdSwap({
-        step,
-        namespace: 'membership',
-        txId: tx_id,
-        label: 'hbd',
-        hiveAmount: hiveForHbd,
-      });
-
-      // Step 3b: Route received HBD to savings, keeping `hbdTransfer` liquid
-      // on paymaster for the member transfer in Step 5c.
-      await hbdToSavings({
-        step,
-        namespace: 'membership',
-        txId: tx_id,
-        label: 'hbd-savings',
-        reserveHbd: hbdTransfer,
-        threshold: config.paymasterSavingsThreshold ?? 600,
-        treasuryAccount: config.treasuryAccount ?? 'ocl-trez',
-      });
-    }
-
-    // Step 3c: Wrap HIVE → SWAP.HIVE then chunked AMM swap to OCLT
-    if (hiveForOclt > 0) {
-      await wrapAndChunkedOcltSwap({
-        step,
-        namespace: 'membership',
-        txId: tx_id,
-        label: 'oclt',
-        hiveAmount: hiveForOclt,
-      });
     }
 
     // ── Step 4: Check balances ──────────────────────────────────────

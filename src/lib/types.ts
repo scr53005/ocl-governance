@@ -93,6 +93,10 @@ export type BaseTxRecord = {
   hbd_swap_metrics: HbdSwapMetrics | null;
   // Timestamps
   created_at: string;
+  // Set once the back-office HIVE conversion (HBD swap + OCLT swap) has fully
+  // completed. Used to make the conversion idempotent across a re-dispatch so a
+  // retry of a later (member-side) failure never re-converts. Null until done.
+  converted_at: string | null;
   processed_at: string | null;
   error: string | null;
 };
@@ -234,6 +238,7 @@ export function newMembershipTxRecord(init: NewMembershipTxRecordInit): Membersh
     oclt_transfer_tx_id: null,
     hbd_transfer_tx_id: null,
     created_at: new Date().toISOString(),
+    converted_at: null,
     processed_at: null,
     error: null,
   };
@@ -262,6 +267,7 @@ export function newEducationTxRecord(init: NewEducationTxRecordInit): EducationT
     swap_hive_tx_id: null,
     hbd_swap_metrics: null,
     created_at: new Date().toISOString(),
+    converted_at: null,
     processed_at: null,
     error: null,
   };

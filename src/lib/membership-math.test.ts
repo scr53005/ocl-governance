@@ -5,6 +5,7 @@ import {
   normalizeDuration,
   getMembershipAmounts,
   resolveMembershipGrants,
+  planAccountAction,
 } from './membership-math';
 import type { Config } from './types';
 
@@ -73,5 +74,41 @@ describe('resolveMembershipGrants', () => {
   it('renewal gets ZERO member grants regardless of duration', () => {
     expect(resolveMembershipGrants('6months', config, true)).toEqual({ stakeOclt: 0, liquidOclt: 0, hbdTransfer: 0 });
     expect(resolveMembershipGrants('1year', config, true)).toEqual({ stakeOclt: 0, liquidOclt: 0, hbdTransfer: 0 });
+  });
+});
+
+describe('planAccountAction', () => {
+  const creator = 'offchain-lux';
+  const ours = { recovery_account: 'offchain-lux', created: '2026-06-10T09:00:00' };
+
+  it('renewal + existing account → skip (the umberto bug: NOT collision even with a non-ours recovery)', () => {
+    expect(planAccountAction({ recovery_account: 'sorin.cristescu', created: '2025-01-01T00:00:00' }, true, creator))
+      .toEqual({ action: 'skip', reason: '' });
+  });
+
+  it('renewal + missing account → renewal_missing', () => {
+    expect(planAccountAction(null, true, creator).action).toBe('renewal_missing');
+  });
+
+  it('new member + missing account → create', () => {
+    expect(planAccountAction(null, false, creator)).toEqual({ action: 'create', reason: '' });
+  });
+
+  it('new member + our recent account → use', () => {
+    expect(planAccountAction(ours, false, creator)).toEqual({ action: 'use', reason: '' });
+    // recovery matching the creator (not literally offchain-lux) also counts.
+    expect(planAccountAction({ recovery_account: 'some-creator', created: '2026-02-02T00:00:00' }, false, 'some-creator').action).toBe('use');
+  });
+
+  it('new member + stranger-owned account → collision', () => {
+    const p = planAccountAction({ recovery_account: 'someone-else', created: '2026-02-02T00:00:00' }, false, creator);
+    expect(p.action).toBe('collision');
+    expect(p.reason).toContain('recovery_account is someone-else');
+  });
+
+  it('new member + our-recovery but pre-2026 account → collision (predates our automation)', () => {
+    const p = planAccountAction({ recovery_account: 'offchain-lux', created: '2024-06-01T12:00:00' }, false, creator);
+    expect(p.action).toBe('collision');
+    expect(p.reason).toContain('before 2026');
   });
 });

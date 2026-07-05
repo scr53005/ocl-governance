@@ -12,14 +12,16 @@ A governance back-office for OffChain Luxembourg, built with Next.js and deploye
 
 ### Automated Membership Provisioning
 
-When HIVE arrives on `ocl-paymaster` with a membership memo (e.g., `cus_XXX:membership:1year:flavien-3`), an automated workflow:
+When HIVE arrives on `ocl-paymaster` with a membership memo (e.g., `cus_XXX:membership:1year:flavien-3`), an automated workflow runs in **two decoupled phases** so a member-side problem can never strand the treasury conversion:
 
-1. **Verifies/creates the member's Hive account** — checks ownership via `recovery_account` + creation date (must be 2026+), creates via offchain.lu API if needed. Aborts with admin alert on name collision.
-2. **Converts received HIVE** — 90% sold for HBD via chunked order-book walk (routed to `ocl-paymaster` savings if savings < 600 HBD, otherwise `ocl-trez`); 10% wrapped to SWAP.HIVE and chunk-swapped for OCLT via the Hive Engine AMM.
-3. **Provisions the member** — stakes OCLT, transfers liquid OCLT + HBD, registers in governance.
-4. **Emails `info@offchain.lu`** with a success summary and, if the account was newly created, emails the member their seed/master password.
+0. **Plan the account (read-only)** — check the member account and decide what Phase B will do (`skip`/`create`/`use`/`collision`/`renewal_missing`) **without acting or aborting**. This read never blocks the conversion; it only sets the small creation-fee reserve.
+1. **Phase A — back-office conversion (always runs, member-independent):** 90% of the received HIVE sold for HBD via chunked order-book walk (routed to `ocl-paymaster` savings if savings < 600 HBD, otherwise `ocl-trez`); 10% wrapped to SWAP.HIVE and chunk-swapped for OCLT via the Hive Engine AMM. Marked `converted_at` on completion, so a re-dispatch never re-converts.
+2. **Phase B — member provisioning (may fail without touching Phase A):** create/verify the account, stake OCLT, transfer liquid OCLT + HBD, register in governance. A **collision** or missing-renewal-account here records a member-side failure and alerts — but the funds are already converted, so **nothing is stranded**; the operator resolves the account and re-dispatches (the conversion won't re-run).
+3. **Emails `info@offchain.lu`** with a success summary and, if the account was newly created, emails the member their seed/master password.
 
-**New members vs. renewals.** A **renewal** (an existing member paying again) is detected from the customer record's `hiveAccountCreated === "skipped_renewal"` (the on-chain memo is identical for both, so the customer record is the only signal). A renewal **skips** account creation and the member grants — **no fresh OCLT stake/transfer and no HBD transfer to the member** — but the HIVE conversion (step 2: HBD→savings + OCLT accumulation) runs **identically**, since it's driven by the received HIVE, not the grant amounts. The new-vs-renewal grant logic is the pure, unit-tested `resolveMembershipGrants` in `src/lib/membership-math.ts`.
+The old single-phase flow aborted the *whole* run (including the conversion) on an account collision — that's the coupling this split removes.
+
+**New members vs. renewals.** A **renewal** (an existing member paying again) is detected from the customer record's `hiveAccountCreated === "skipped_renewal"` (the on-chain memo is identical for both, so the customer record is the only signal). A renewal **skips** account creation, the member grants — **no fresh OCLT stake/transfer and no HBD transfer to the member** — and the **account-ownership/collision check** (that check exists only to avoid sending tokens to a stranger's account; a renewal sends the member no tokens, and a renewing member may have changed their `recovery_account` or predate our automation, so enforcing "recovery = offchain-lux" would wrongly reject them). But the HIVE conversion (Phase A: HBD→savings + OCLT accumulation) runs **identically**, since it's driven by the received HIVE, not the grant amounts. The new-vs-renewal grant logic and the read-only account verdict are the pure, unit-tested `resolveMembershipGrants` and `planAccountAction` in `src/lib/membership-math.ts`.
 
 **Duration labels vs. the memo.** The customer record labels the annual plan `"12months"` (and the six-month plan `"6months"`), but the payment-memo convention and the cron validator only accept `"1year"` / `"6months"`. Any code that **constructs** a membership memo (the funding workflow, the trigger script) or filters the customer list normalizes the label through `normalizeDuration` in `src/lib/membership-math.ts` (`"12months" → "1year"`); an unrecognized label returns `null` and doubles as the membership-vs-education discriminator. `membership-provision` itself only ever receives the already-validated canonical duration from the cron.
 
@@ -250,6 +252,7 @@ src/
       inngest/route.ts                   Inngest serve endpoint
       ops/pending-members/route.ts       GET membership customers needing provisioning
       ops/fund-membership/route.ts       POST — start the funding workflow for one customer
+      ops/redispatch-membership/route.ts POST — re-fire membership-provision for a failed/stuck tx
   components/
     ProjectionTable.tsx                  Interactive projection table (client)
     VotingInner.tsx                      Voting UI (client)
@@ -279,6 +282,7 @@ scripts/
   inspect-customer.ts                    Read-only dump of one customer record from Redis
   trigger-funding.ts                     Dispatch the fund-membership workflow (dry-run by default)
   recover-funding-withdrawal.ts          Withdraw already-bought HIVE for a stuck funding run (dry-run by default)
+  redispatch-membership.ts               Re-fire membership-provision for a failed/stuck tx (dry-run by default)
   list-our-accounts.ts                   Audit Hive accounts owned by offchain-lux
 config.json                              Base configuration (seeded to Redis)
 vercel.json                              Cron schedule configuration

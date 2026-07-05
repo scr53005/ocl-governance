@@ -46,6 +46,45 @@ export type MembershipGrants = {
   hbdTransfer: number;
 };
 
+// ── Account plan (what Phase B does with the member account) ──────────
+
+export type AccountInfoLite = { recovery_account: string; created: string } | null;
+
+export type AccountAction = 'skip' | 'renewal_missing' | 'create' | 'use' | 'collision';
+export type AccountPlan = { action: AccountAction; reason: string };
+
+/**
+ * Decide what the member phase should do with the account — a pure read-only
+ * verdict that NEVER aborts the back-office conversion.
+ *
+ * - renewal + account present → `skip` (no create/grants/ownership check — a
+ *   renewal sends the member no tokens, so "is this account ours" is moot and a
+ *   renewing member may legitimately have a non-offchain-lux recovery_account).
+ * - renewal + account absent  → `renewal_missing` (anomaly; member can't proceed).
+ * - new + account absent       → `create`.
+ * - new + account present, ours (recovery = creator/offchain-lux AND created
+ *   2026+) → `use`.
+ * - new + account present, NOT ours → `collision` (member blocked; don't send
+ *   tokens to a stranger's account).
+ */
+export function planAccountAction(info: AccountInfoLite, renewal: boolean, creator: string): AccountPlan {
+  if (renewal) {
+    return info
+      ? { action: 'skip', reason: '' }
+      : { action: 'renewal_missing', reason: 'account does not exist' };
+  }
+  if (!info) return { action: 'create', reason: '' };
+  const isOurRecovery = info.recovery_account === creator || info.recovery_account === 'offchain-lux';
+  // `created` is UTC (we append 'Z') — compare the UTC year so the 2026 cutoff
+  // doesn't shift with the server's timezone.
+  const isRecentEnough = new Date(info.created + 'Z').getUTCFullYear() >= 2026;
+  if (isOurRecovery && isRecentEnough) return { action: 'use', reason: '' };
+  const reason = !isOurRecovery
+    ? `recovery_account is ${info.recovery_account} (expected ${creator} or offchain-lux)`
+    : `created ${info.created} (before 2026, predates our account creation)`;
+  return { action: 'collision', reason };
+}
+
 /** The per-member grant amounts for a NEW membership, by duration. */
 export function getMembershipAmounts(duration: MembershipDuration, config: Config): MembershipGrants {
   const is1Year = duration === '1year';
