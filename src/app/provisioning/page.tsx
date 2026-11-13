@@ -1,6 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useState } from 'react';
+import { fundButtonLabel } from '@/lib/funding-switch';
 
 type PendingMember = {
   customerId: string;
@@ -42,6 +43,10 @@ export default function ProvisioningPage() {
   const [eurInputs, setEurInputs] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState<Record<string, boolean>>({});
   const [rowMsg, setRowMsg] = useState<Record<string, string>>({});
+  // Kill switch state from the server (FUNDING_ENABLED). Default to disabled
+  // until the list loads, so the button is never live by accident.
+  const [fundingEnabled, setFundingEnabled] = useState(false);
+  const [fundingDisabledMessage, setFundingDisabledMessage] = useState<string | null>(null);
 
   const fetchMembers = useCallback(async () => {
     setLoading(true);
@@ -49,8 +54,15 @@ export default function ProvisioningPage() {
     try {
       const res = await fetch('/api/ops/pending-members', { cache: 'no-store' });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const { members: list } = (await res.json()) as { members: PendingMember[] };
+      const { members: list, fundingEnabled: enabled, fundingDisabledMessage: disabledMsg } =
+        (await res.json()) as {
+          members: PendingMember[];
+          fundingEnabled?: boolean;
+          fundingDisabledMessage?: string | null;
+        };
       setMembers(list);
+      setFundingEnabled(enabled === true);
+      setFundingDisabledMessage(disabledMsg ?? null);
       // Seed the EUR inputs from each row's computed default (blank if unknown).
       setEurInputs((prev) => {
         const next = { ...prev };
@@ -123,6 +135,13 @@ export default function ProvisioningPage() {
         the 5-minute cron then runs the actual provisioning.
       </p>
 
+      {!loading && !error && !fundingEnabled && (
+        <div className="mb-6 max-w-3xl rounded-lg border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+          <strong>Funding paused.</strong>{' '}
+          {fundingDisabledMessage ?? 'Binance funding is disabled.'}
+        </div>
+      )}
+
       {loading ? (
         <p className="text-gray-500">Loading…</p>
       ) : error ? (
@@ -144,7 +163,7 @@ export default function ProvisioningPage() {
             <tbody>
               {members.map((m) => {
                 const hasFunding = m.fundingStatus != null;
-                const canStart = !hasFunding && !busy[m.customerId];
+                const canStart = fundingEnabled && !hasFunding && !busy[m.customerId];
                 // Provisioning status (downstream) takes precedence over the
                 // funding label once the cron has picked up the arrival.
                 const statusText = m.provisioningStatus
@@ -200,9 +219,10 @@ export default function ProvisioningPage() {
                         <button
                           onClick={() => startFunding(m)}
                           disabled={!canStart}
+                          title={fundingEnabled ? undefined : 'Funding paused (FUNDING_ENABLED)'}
                           className="bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white text-sm font-semibold py-2 px-4 rounded-lg transition-colors"
                         >
-                          {busy[m.customerId] ? 'Starting…' : 'Start provisioning'}
+                          {busy[m.customerId] ? 'Starting…' : fundButtonLabel(m.isRenewal)}
                         </button>
                       )}
                       {rowMsg[m.customerId] && (

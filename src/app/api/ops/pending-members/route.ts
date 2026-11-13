@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 import { redis } from '@/lib/redis';
 import { isRenewal, normalizeDuration } from '@/lib/membership-math';
 import { computeFundableEur } from '@/lib/funding-math';
+import { isFundingEnabled, FUNDING_DISABLED_MESSAGE } from '@/lib/funding-switch';
 import type { CustomerRecord, FundingTxRecord, MembershipDuration, TxStatus } from '@/lib/types';
 
 // GET /api/ops/pending-members
@@ -11,8 +12,7 @@ import type { CustomerRecord, FundingTxRecord, MembershipDuration, TxStatus } fr
 // Each row is joined with its funding:tx:* status so the operator can see
 // what's already in flight and never double-click a fund.
 //
-// TODO(auth): this route is intentionally OPEN for now — operator auth is
-// being handled in the website-merge phase. Gate it before that merge ships.
+// Auth: gated by src/middleware.ts (Basic Auth, OCL_ADMIN_PASSWORD) — interim until the merge ships real admin auth.
 
 export type PendingMember = {
   customerId: string;
@@ -97,7 +97,12 @@ export async function GET() {
     // Oldest first — provision in the order customers paid.
     members.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
 
-    return NextResponse.json({ members });
+    const fundingEnabled = isFundingEnabled();
+    return NextResponse.json({
+      members,
+      fundingEnabled,
+      fundingDisabledMessage: fundingEnabled ? null : FUNDING_DISABLED_MESSAGE,
+    });
   } catch (err) {
     console.error('[ops/pending-members] failed:', err);
     return NextResponse.json({ error: 'failed to list pending members' }, { status: 500 });

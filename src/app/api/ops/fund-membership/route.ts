@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 import { redis } from '@/lib/redis';
 import { inngest } from '@/lib/inngest';
 import { normalizeDuration } from '@/lib/membership-math';
+import { isFundingEnabled, FUNDING_DISABLED_MESSAGE } from '@/lib/funding-switch';
 import type { CustomerRecord, FundingTxRecord } from '@/lib/types';
 
 // POST /api/ops/fund-membership
@@ -12,7 +13,7 @@ import type { CustomerRecord, FundingTxRecord } from '@/lib/types';
 //
 // The operator enters `eurAmount` = the EUR they moved to Binance by hand.
 //
-// TODO(auth): OPEN for now — operator auth lands in the website-merge phase.
+// Auth: gated by src/middleware.ts (Basic Auth, OCL_ADMIN_PASSWORD) — interim until the merge ships real admin auth.
 
 const CUSTOMER_ID_RE = /^cus_[A-Za-z0-9]+$/;
 // Sanity bounds on a single manual funding request (EUR). A membership is
@@ -26,6 +27,11 @@ const IN_FLIGHT: ReadonlySet<FundingTxRecord['status']> = new Set([
 ]);
 
 export async function POST(req: Request) {
+  // Kill switch (fail-safe: off unless FUNDING_ENABLED=true). See lib/funding-switch.ts.
+  if (!isFundingEnabled()) {
+    return NextResponse.json({ error: FUNDING_DISABLED_MESSAGE }, { status: 503 });
+  }
+
   let body: unknown;
   try {
     body = await req.json();

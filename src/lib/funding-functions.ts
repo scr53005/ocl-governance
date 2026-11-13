@@ -43,6 +43,7 @@ import {
 } from './types';
 import { floorHive, computeNetHive, decideBuyPlan, type BuyPlan } from './funding-math';
 import { normalizeDuration } from './membership-math';
+import { isFundingEnabled } from './funding-switch';
 
 // Binance HIVE network withdrawal fee, in HIVE. Overridable via env to match
 // whatever Binance currently charges without a redeploy.
@@ -103,6 +104,17 @@ export const fundMembership = inngest.createFunction(
     const maxSlippageBps = max_slippage_bps ?? DEFAULT_MAX_SLIPPAGE_BPS;
     const usdcChunkSizeMax = usdc_chunk_size_max ?? USDC_CHUNK_SIZE_MAX_DEFAULT;
     const withdrawOrderId = `ocl-fund-${stripe_customer_id}`;
+
+    // ── Kill switch (lib/funding-switch.ts) ─────────────────────────────
+    // Checked here too, not just in the API route, so events sent directly
+    // (scripts/trigger-funding.ts) are refused as well. Memoized so a replay
+    // can't flip the decision mid-run; it only gates NEW runs, before any
+    // record is touched or EUR spent.
+    const fundingEnabled = await step.run('check-funding-switch', () => isFundingEnabled());
+    if (!fundingEnabled) {
+      console.warn(`[FUNDING] ${stripe_customer_id}: refused — FUNDING_ENABLED is off`);
+      return { status: 'disabled', customer: stripe_customer_id };
+    }
 
     // ── Step 0: load customer, init/resume funding record ───────────────
     // Cross-run safety: Inngest step-memoization only dedups WITHIN one run.

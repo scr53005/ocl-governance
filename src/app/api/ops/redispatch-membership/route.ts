@@ -14,7 +14,7 @@ import type { MembershipTxRecord } from '@/lib/types';
 // after a failure that happened before on-chain side effects (e.g. the
 // ownership-check abort); a fresh Inngest run re-executes from the top.
 //
-// TODO(auth): OPEN for now — operator auth lands in the website-merge phase.
+// Auth: gated by src/middleware.ts (Basic Auth, OCL_ADMIN_PASSWORD) — interim until the merge ships real admin auth.
 
 export async function POST(req: Request) {
   let body: unknown;
