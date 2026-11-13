@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 import { redis } from '@/lib/redis';
 import { inngest } from '@/lib/inngest';
 import { normalizeDuration } from '@/lib/membership-math';
+import { isFundingEnabled, FUNDING_DISABLED_MESSAGE } from '@/lib/funding-switch';
 import type { CustomerRecord, FundingTxRecord } from '@/lib/types';
 
 // POST /api/ops/fund-membership
@@ -26,6 +27,11 @@ const IN_FLIGHT: ReadonlySet<FundingTxRecord['status']> = new Set([
 ]);
 
 export async function POST(req: Request) {
+  // Kill switch (fail-safe: off unless FUNDING_ENABLED=true). See lib/funding-switch.ts.
+  if (!isFundingEnabled()) {
+    return NextResponse.json({ error: FUNDING_DISABLED_MESSAGE }, { status: 503 });
+  }
+
   let body: unknown;
   try {
     body = await req.json();
