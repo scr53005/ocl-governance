@@ -11,8 +11,7 @@ import type { CustomerRecord, FundingTxRecord, MembershipDuration, TxStatus } fr
 // Each row is joined with its funding:tx:* status so the operator can see
 // what's already in flight and never double-click a fund.
 //
-// TODO(auth): this route is intentionally OPEN for now — operator auth is
-// being handled in the website-merge phase. Gate it before that merge ships.
+// Auth: gated by src/middleware.ts (Basic Auth, OCL_ADMIN_PASSWORD) — interim until the merge ships real admin auth.
 
 export type PendingMember = {
   customerId: string;

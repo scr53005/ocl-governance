@@ -58,7 +58,7 @@ npx tsx scripts/trigger-funding.ts cus_XXXX --eur 117.43 --send   # override the
 
 **Or from the UI** — the **Member Provisioning** page (`/provisioning`, linked from the home page) lists membership customers who have paid but aren't yet provisioned (`customer:*` with `provisionedAt == null` and a membership duration — education records, which never carry a duration, are excluded). Each row shows new-vs-renewal, a €-to-spend input (prefilled with the computed fundable amount), and a live status. That status is joined from two places: the **funding** leg (`funding:tx:*`) and, once the HIVE has landed, the downstream **provisioning** run (`membership:tx:*`, looked up via the funding record's `withdraw_tx_id` — which equals the on-chain arrival tx id the cron keys on). Provisioning status takes precedence, so the row progresses `Funding → HIVE delivered — awaiting cron → Provisioning in progress → Provisioned ✓`, then drops off the list once `provisionedAt` is set. A row that's already funding shows status instead of a button and can't be double-clicked. "Start provisioning" POSTs to `/api/ops/fund-membership`, which sanitizes the € (1–1000, 2 dp), refuses if already provisioned or funding is in flight, and sends `membership/funding-requested`. `GET /api/ops/pending-members` backs the list. (The list refreshes on the **Refresh** button.)
 
-> ⚠️ **No auth yet.** The provisioning page and its API routes are currently **open** (marked `TODO(auth)`). Operator authentication is being handled as part of the offchain.lu ↔ ocl-governance merge; gate these before that merge ships, since `POST /api/ops/fund-membership` spends real money.
+> 🔒 **Operator auth (interim).** `/provisioning`, `/api/ops/*` and projection writes (`POST`/`DELETE /api/projections`) are behind HTTP Basic Auth in `src/middleware.ts` — any username, password = `OCL_ADMIN_PASSWORD` (fails closed with 503 if unset). Real admin auth comes with the offchain.lu ↔ ocl-governance merge.
 
 ## Payment Workflows
 
@@ -154,8 +154,9 @@ Both swap strategies cap at **20 chunks** per workflow execution. The number is 
 - **Hive blockchain** — HBD balances, account history, transfers, limit orders via `@hiveio/dhive`
 - **Hive Engine** — OCLT token supply, stakes, AMM pool reserves, token operations
 - **ECB** — USD/EUR exchange rate (used to convert HBD to EUR, then to OCLT at 500 OCLT/EUR)
-- **Upstash Redis** — Configuration, member list, customer records (shared with offchain.lu), transaction audit trail, memo routing table
-- **Inngest** — Durable workflow orchestration for membership provisioning
+- **Binance Spot** (via the VPS executor at `EXECUTOR_BASE_URL`) — EUR/USDC/HIVE trading and HIVE withdrawals for the membership-funding leg. Signed calls never leave the executor (static-IPv4 boundary).
+- **Upstash Redis** — Configuration, member list, customer records (shared with offchain.lu), transaction audit trail, memo routing table, funding records
+- **Inngest** — Durable workflow orchestration for membership provisioning + funding
 
 ## Setup
 
@@ -184,6 +185,7 @@ INNGEST_SIGNING_KEY=...                # Inngest signing key (preview)
 INNGEST_DEV=1                          # Required for local Inngest dev server
 OCL_INTERNAL_API_KEY=...               # Shared secret for cross-app auth
 OFFCHAIN_LU_URL=https://www.offchain.lu  # Website API base URL
+OCL_ADMIN_PASSWORD=...                 # Operator password (Basic Auth) for /provisioning, /api/ops/*, projection writes
 
 # Membership funding (outbound EUR → HIVE via Binance)
 EXECUTOR_BASE_URL=https://api.converthbdeur.offchain.lu  # VPS Binance executor (static IPv4). Optional — this is the default.
@@ -321,5 +323,7 @@ Deployed on Vercel at [dho.offchain.lu](https://dho.offchain.lu). Required envir
 - `INNGEST_EVENT_KEY`, `INNGEST_SIGNING_KEY` — Inngest (production keys)
 - `OCL_INTERNAL_API_KEY` — Cross-app auth with offchain.lu
 - `OFFCHAIN_LU_URL` — `https://www.offchain.lu`
+- `OCL_ADMIN_PASSWORD` — operator password for the Basic Auth gate in `src/middleware.ts` (provisioning page, `/api/ops/*`, projection writes)
+- `EXECUTOR_API_KEY` — Bearer token for the VPS Binance executor (membership funding). `EXECUTOR_BASE_URL` optional (defaults to `https://api.converthbdeur.offchain.lu`); `BINANCE_HIVE_WITHDRAWAL_FEE` optional (defaults to `0.1`).
 
 The Inngest integration is connected via the Vercel Marketplace with deployment protection bypass configured.

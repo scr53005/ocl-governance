@@ -12,7 +12,7 @@ import type { CustomerRecord, FundingTxRecord } from '@/lib/types';
 //
 // The operator enters `eurAmount` = the EUR they moved to Binance by hand.
 //
-// TODO(auth): OPEN for now — operator auth lands in the website-merge phase.
+// Auth: gated by src/middleware.ts (Basic Auth, OCL_ADMIN_PASSWORD) — interim until the merge ships real admin auth.
 
 const CUSTOMER_ID_RE = /^cus_[A-Za-z0-9]+$/;
 // Sanity bounds on a single manual funding request (EUR). A membership is
