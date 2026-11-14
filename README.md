@@ -217,10 +217,10 @@ BINANCE_HIVE_WITHDRAWAL_FEE=0.1        # Optional — Binance HIVE network withd
 ```bash
 npm install
 npm run seed    # pushes config + memo routes into Redis (one-time). Prints a safety banner with host + GOV_KV_ENV label before writing — double-check before hitting enter.
-npx next dev --port 3100    # dev server at http://localhost:3100
+npm run dev    # next dev --port 3088 → http://localhost:3088
 ```
 
-(Port 3100 is the project convention — port 3000 is reserved for a sibling app.)
+(Port 3088 is the project convention, set in `package.json` — the website dev server uses 8088 and its Express API 3010.)
 
 ### Testing
 
@@ -238,7 +238,7 @@ npm run test:watch
 In a separate terminal:
 
 ```bash
-npx inngest-cli@latest dev
+npx inngest-cli@latest dev -u http://localhost:3088/api/inngest
 ```
 
 This starts the Inngest dev dashboard at `http://localhost:8288` where you can inspect and test the workflows. Make sure `INNGEST_DEV=1` in `.env.local` so the SDK talks to the local dashboard instead of Inngest Cloud.
@@ -251,7 +251,7 @@ Three helper scripts make dev testing against a real Hive account safe and repea
 - `npx tsx scripts/set-cursor.ts` — advances `membership:last_tx_id` (the paymaster-wide scan cursor) past existing account history so a freshly seeded dev Redis doesn't re-process the entire backlog on the first cron run. Supports `--value N` for an exact sequence number and `--reset` to go back to `-1`.
 - Trigger the cron manually from PowerShell:
   ```powershell
-  Invoke-RestMethod -Uri "http://localhost:3100/api/cron/scan-transfers" `
+  Invoke-RestMethod -Uri "http://localhost:3088/api/cron/scan-transfers" `
     -Headers @{ Authorization = "Bearer $env:CRON_SECRET" }
   ```
 
