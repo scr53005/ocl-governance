@@ -272,3 +272,61 @@ export function newEducationTxRecord(init: NewEducationTxRecordInit): EducationT
     error: null,
   };
 }
+
+// ── Contribution record (Redis key: "contribution:<stripeSessionId>") ──
+//
+// One per paid OCLT contribution. Written by POST /api/internal/contributions
+// (called by the offchain.lu Stripe webhook). Claim link → claim page creates
+// the ito account and stakes OCLT. Never holds keys, seeds or passwords.
+
+export type ContributionStatus =
+  | 'paid'             // recorded, claim link issued, waiting for the contributor
+  | 'claiming'         // claim started: ito name reserved, account creation in flight
+  | 'account_created'  // account exists on chain, keys shown — NOT yet confirmed saved
+                       //   (re-opening the link rotates the keys and shows new ones)
+  | 'claimed'          // contributor confirmed the keys are saved — link is spent
+  | 'failed';          // needs operator attention (see error)
+
+export type ContributionRecord = {
+  session_id: string;
+  email: string;
+  first_name: string;
+  last_name: string;
+  amount_eur: number;          // gross, from Stripe amount_total
+  oclt_amount: number;         // OCLT to stake = amount_eur × OCLT_PER_EUR
+  status: ContributionStatus;
+  claim_version: number;       // bump to re-issue (invalidates the old link)
+  claim_expires_at: string;    // ISO
+  account_name: string | null;
+  account_creation_tx_id: string | null;
+  oclt_stake_tx_id: string | null;   // null until the OCLT stake is broadcast (retried on re-claim)
+  keys_issued_count: number;         // 1 at creation, +1 per key rotation
+  created_at: string;
+  claimed_at: string | null;
+  error: string | null;
+};
+
+export type NewContributionRecordInit = {
+  session_id: string;
+  email: string;
+  first_name: string;
+  last_name: string;
+  amount_eur: number;
+  oclt_amount: number;
+  created_at: string;
+  claim_expires_at: string;
+};
+
+export function newContributionRecord(init: NewContributionRecordInit): ContributionRecord {
+  return {
+    ...init,
+    status: 'paid',
+    claim_version: 1,
+    account_name: null,
+    account_creation_tx_id: null,
+    oclt_stake_tx_id: null,
+    keys_issued_count: 0,
+    claimed_at: null,
+    error: null,
+  };
+}
