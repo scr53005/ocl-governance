@@ -62,6 +62,17 @@ npx tsx scripts/trigger-funding.ts cus_XXXX --eur 117.43 --send   # override the
 
 > 🔒 **Operator auth (interim).** `/provisioning`, `/api/ops/*` and projection writes (`POST`/`DELETE /api/projections`) are behind HTTP Basic Auth in `src/middleware.ts` — any username, password = `OCL_ADMIN_PASSWORD` (fails closed with 503 if unset). Real admin auth comes with the offchain.lu ↔ ocl-governance merge.
 
+### OCLT Contributions (claim link → ito account)
+
+A contributor pays on www.offchain.lu (Stripe, one-off). The website webhook calls `POST /api/internal/contributions` (X-API-Key), which records `contribution:<sessionId>` (500 OCLT per **gross** €, Stripe fees absorbed) and returns a **claim token**. The website emails `www.offchain.lu/contribute/claim/<token>` — clicking it *is* the email verification.
+
+On the claim page the website proxies to `…/contributions/status`, `…/claim` and `…/confirm` (all X-API-Key):
+1. **Claim** reserves the next free `ito` + 6-digit name (Redis counter `contribution:ito_counter`, names taken on chain are skipped — so it continues after the hand-made `ito000001`–`ito000009`), creates the account with **`ocl-ito1` as creator and in the owner `account_auths`**, stakes the OCLT from `ocl-ito1`, and returns the keys **once** (never stored).
+2. Re-opening the link before confirming **rotates the keys** (account_update signed by `ocl-ito1`'s active key through the owner account_auths) — no second account, no second stake. Hive allows roughly one owner change per hour, so an immediate second re-open may be refused.
+3. **Confirm** ("I've saved my keys") marks it `claimed`; the link is spent.
+
+Claim tokens are a deterministic HMAC of the session (retried webhooks get the same link); only `sha256(token)` is stored; links expire after 90 days if unclaimed. Statuses: `paid → claiming → account_created → claimed` (or `failed` → operator alert). Code: `src/lib/contribution-*.ts`. Set `HIVE_MOCK_BROADCAST=true` on a preview to exercise the flow without broadcasting (it still consumes ito counter numbers in the shared Redis — harmless gaps).
+
 ## Payment Workflows
 
 ### Memo convention
@@ -193,6 +204,9 @@ OCL_ADMIN_PASSWORD=...                 # Operator password (Basic Auth) for /pro
 EXECUTOR_BASE_URL=https://api.converthbdeur.offchain.lu  # VPS Binance executor (static IPv4). Optional — this is the default.
 EXECUTOR_API_KEY=...                   # Bearer token for the executor (same executor hbdfiat uses)
 FUNDING_ENABLED=false                  # Kill switch for the Binance funding leg — must be "true" to allow funding runs
+CONTRIBUTION_CLAIM_SECRET=...           # ≥32 random chars; HMAC key for contribution claim links
+HIVE_ACTIVE_KEY_ITO1=...                # ocl-ito1 active key: creates ito accounts, stakes OCLT, rotates contributor keys
+HIVE_MOCK_BROADCAST=false               # true = log contribution broadcasts instead of sending (previews)
 BINANCE_HIVE_WITHDRAWAL_FEE=0.1        # Optional — Binance HIVE network withdrawal fee, in HIVE (default 0.1)
 ```
 

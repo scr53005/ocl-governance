@@ -1,10 +1,14 @@
 // src/lib/contribution-kv.ts
 //
-// Binds the contribution store to the real Upstash client. Kept separate from
-// contribution-store.ts so tests never import ./redis.
+// Binds the contribution store and claim logic to the real Upstash client,
+// Hive chain and alerting. Kept separate from contribution-store.ts /
+// contribution-claim.ts so tests never import ./redis or touch the network.
 
 import { redis } from './redis';
 import { createContributionStore, type KvLike } from './contribution-store';
+import { liveChain } from './contribution-chain';
+import { sendAlert } from './workflow-helpers';
+import type { ClaimDeps } from './contribution-claim';
 
 const upstashKv: KvLike = {
   get: (key) => redis.get(key),
@@ -15,6 +19,7 @@ const upstashKv: KvLike = {
     return redis.set(key, value);
   },
   incr: (key) => redis.incr(key),
+  del: (key) => redis.del(key),
 };
 
 export function getContributionStore() {
@@ -23,16 +28,12 @@ export function getContributionStore() {
   return createContributionStore(upstashKv, secret);
 }
 
-/**
- * Where the claim links in contributors' emails point.
- * - CLAIM_BASE_URL if set (explicit override, e.g. local testing via a tunnel)
- * - on a Vercel PREVIEW deployment: that branch's stable preview URL, so a
- *   test contribution made against a preview is claimed on the same preview
- *   (where the new code lives), not on production
- * - otherwise production: https://dho.offchain.lu
- */
-export function claimBaseUrl(env: Record<string, string | undefined> = process.env): string {
-  if (env.CLAIM_BASE_URL) return env.CLAIM_BASE_URL;
-  if (env.VERCEL_ENV === 'preview' && env.VERCEL_BRANCH_URL) return `https://${env.VERCEL_BRANCH_URL}`;
-  return 'https://dho.offchain.lu';
+export function getClaimDeps(): ClaimDeps {
+  return {
+    store: getContributionStore(),
+    chain: liveChain,
+    alert: sendAlert,
+    now: () => Date.now(),
+    sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+  };
 }

@@ -1,15 +1,14 @@
 import { NextResponse } from 'next/server';
 import { isValidInternalApiKey } from '@/lib/internal-auth';
 import { validateContributionIntake } from '@/lib/contribution-math';
-import { buildClaimUrl } from '@/lib/contribution-store';
-import { getContributionStore, claimBaseUrl } from '@/lib/contribution-kv';
+import { getContributionStore } from '@/lib/contribution-kv';
 
 // POST /api/internal/contributions
 // Called by the offchain.lu Stripe webhook after a contribution is paid.
 // Body: { sessionId, email, firstName, lastName, amountEur }  (amountEur = gross, from amount_total)
-// Returns: { claimUrl, ocltAmount, expiresAt, created }
-// The website puts claimUrl in the thank-you email; the link IS the email
-// verification. Idempotent per Stripe session (retries get the same link).
+// Returns: { claimToken, ocltAmount, expiresAt, status, created }
+// The website builds www.offchain.lu/contribute/claim/<claimToken> and puts it
+// in the thank-you email; the link IS the email verification. Idempotent per Stripe session (retries get the same link).
 //
 // Auth: X-API-Key = OCL_INTERNAL_API_KEY (server-to-server; not behind Basic Auth).
 
@@ -36,7 +35,7 @@ export async function POST(req: Request) {
       `€${record.amount_eur} → ${record.oclt_amount} OCLT (status ${record.status})`,
     );
     return NextResponse.json({
-      claimUrl: buildClaimUrl(claimBaseUrl(), token),
+      claimToken: token,
       ocltAmount: record.oclt_amount,
       expiresAt: record.claim_expires_at,
       status: record.status,

@@ -281,9 +281,10 @@ export function newEducationTxRecord(init: NewEducationTxRecordInit): EducationT
 
 export type ContributionStatus =
   | 'paid'             // recorded, claim link issued, waiting for the contributor
-  | 'claiming'         // claim started: account name reserved, creation in flight
-  | 'account_created'  // ito account exists on chain; keys were shown once
-  | 'claimed'          // OCLT stake broadcast — done
+  | 'claiming'         // claim started: ito name reserved, account creation in flight
+  | 'account_created'  // account exists on chain, keys shown — NOT yet confirmed saved
+                       //   (re-opening the link rotates the keys and shows new ones)
+  | 'claimed'          // contributor confirmed the keys are saved — link is spent
   | 'failed';          // needs operator attention (see error)
 
 export type ContributionRecord = {
@@ -298,7 +299,8 @@ export type ContributionRecord = {
   claim_expires_at: string;    // ISO
   account_name: string | null;
   account_creation_tx_id: string | null;
-  oclt_stake_tx_id: string | null;
+  oclt_stake_tx_id: string | null;   // null until the OCLT stake is broadcast (retried on re-claim)
+  keys_issued_count: number;         // 1 at creation, +1 per key rotation
   created_at: string;
   claimed_at: string | null;
   error: string | null;
@@ -323,6 +325,7 @@ export function newContributionRecord(init: NewContributionRecordInit): Contribu
     account_name: null,
     account_creation_tx_id: null,
     oclt_stake_tx_id: null,
+    keys_issued_count: 0,
     claimed_at: null,
     error: null,
   };

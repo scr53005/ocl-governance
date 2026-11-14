@@ -8,6 +8,7 @@
 //   contribution:<sessionId>        → ContributionRecord (JSON)
 //   contribution:claim:<sha256(tok)> → sessionId   (TTL = claim validity)
 //   contribution:ito_counter         → last ito number handed out (INCR)
+//   contribution:lock:<sessionId>    → claim in progress (SET NX, short TTL)
 
 import {
   claimToken,
@@ -24,19 +25,18 @@ export type KvLike = {
   get<T = unknown>(key: string): Promise<T | null>;
   set(key: string, value: string, opts?: { nx?: boolean; ex?: number }): Promise<unknown>;
   incr(key: string): Promise<number>;
+  del(key: string): Promise<unknown>;
 };
 
 export const contributionKey = (sessionId: string) => `contribution:${sessionId}`;
 export const claimLookupKey = (tokenHash: string) => `contribution:claim:${tokenHash}`;
 export const ITO_COUNTER_KEY = 'contribution:ito_counter';
+export const claimLockKey = (sessionId: string) => `contribution:lock:${sessionId}`;
+export const CLAIM_LOCK_SECONDS = 180;
 
 function parse<T>(raw: unknown): T | null {
   if (raw == null) return null;
   return (typeof raw === 'string' ? JSON.parse(raw) : raw) as T;
-}
-
-export function buildClaimUrl(baseUrl: string, token: string): string {
-  return `${baseUrl.replace(/\/+$/, '')}/claim/${token}`;
 }
 
 export function createContributionStore(kv: KvLike, secret: string) {
@@ -107,7 +107,16 @@ export function createContributionStore(kv: KvLike, secret: string) {
     return kv.incr(ITO_COUNTER_KEY);
   }
 
-  return { get, save, register, resolveToken, nextItoNumber, linkToken };
+  /** One claim at a time per contribution (double-click, two tabs). */
+  async function acquireClaimLock(sessionId: string): Promise<boolean> {
+    return (await kv.set(claimLockKey(sessionId), '1', { nx: true, ex: CLAIM_LOCK_SECONDS })) === 'OK';
+  }
+
+  async function releaseClaimLock(sessionId: string): Promise<void> {
+    await kv.del(claimLockKey(sessionId));
+  }
+
+  return { get, save, register, resolveToken, nextItoNumber, linkToken, acquireClaimLock, releaseClaimLock };
 }
 
 export type ContributionStore = ReturnType<typeof createContributionStore>;

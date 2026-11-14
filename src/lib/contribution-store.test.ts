@@ -1,7 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import {
   createContributionStore,
-  buildClaimUrl,
   contributionKey,
   type KvLike,
 } from './contribution-store';
@@ -34,6 +33,9 @@ function fakeKv() {
       const n = Number(store.get(key) ?? 0) + 1;
       store.set(key, String(n));
       return n;
+    },
+    async del(key) {
+      return store.delete(key) ? 1 : 0;
     },
   };
   return { kv, store, ttls };
@@ -128,12 +130,5 @@ describe('contribution store: ito counter', () => {
     const s = createContributionStore(kv, SECRET);
     expect(await s.nextItoNumber()).toBe(1);
     expect(await s.nextItoNumber()).toBe(2);
-  });
-});
-
-describe('buildClaimUrl', () => {
-  it('joins base and token without double slashes', () => {
-    expect(buildClaimUrl('https://dho.offchain.lu/', 'tok')).toBe('https://dho.offchain.lu/claim/tok');
-    expect(buildClaimUrl('https://dho.offchain.lu', 'tok')).toBe('https://dho.offchain.lu/claim/tok');
   });
 });
